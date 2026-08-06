@@ -20,7 +20,8 @@
 
 import unicorn_ffi
 import machparse
-import std/[os, strformat, posix]
+import objc_ffi
+import std/[os, strformat, strutils, posix, tables, dynlib]
 
 const
   CodeBase: uint64 = 0x1000
@@ -40,21 +41,39 @@ var traceCount = 0
 const traceMax = 200
 var verboseMode = false  # off by default: only the process's own output and real errors are shown
 
-proc onCode(uc: UcHandle, address: culonglong, size: uint32, userData: pointer) {.cdecl.} =
-  inc traceCount
-  if traceCount <= traceMax:
-    echo &"[trace] pc=0x{uint64(address):x} size={size}"
-  elif traceCount == traceMax + 1:
-    echo &"[trace] ... stopping trace output after {traceMax} instructions"
+const
+  ThunkBase: uint64 = 0x300000000'u64  # dedicated region for thunk trampolines, never real guest code
+  ThunkSlotSize: uint64 = 16
 
-proc onMemUnmapped(uc: UcHandle, memType: cint, address: culonglong,
-                    size: cint, value: clonglong, userData: pointer): bool {.cdecl.} =
-  if verboseMode:
-    echo &"[fault] unmapped memory access — type={memType} addr=0x{uint64(address):x} size={size}"
-  return false  # do not resolve it; let uc_emu_start return the real error after logging
+# ---- REAL host libSystem functions, called directly since 86arm itself is
+# a native process linked against the host's real libSystem. Each thunk
+# reads its arguments from ARM64 registers per AAPCS64 (x0, x1, ... for
+# integer/pointer args), calls the real host implementation, writes the
+# result to x0, then sets PC = LR so execution "returns" to the caller.
+proc c_getpid(): cint {.importc: "getpid", header: "<unistd.h>".}
+proc c_malloc(size: csize_t): pointer {.importc: "malloc", header: "<stdlib.h>".}
+proc c_free(p: pointer) {.importc: "free", header: "<stdlib.h>".}
+
+# ---- objc_msgSend: NOT a fixed signature — real Objective-C messages take
+# a variable number/type of arguments depending on the selector. Without
+# libffi + runtime type-encoding lookup (not implemented yet), we can only
+# support a FIXED set of call shapes, each cast to its own function-pointer
+# type. This covers two common shapes:
+#   0 extra args, pointer return  — e.g. -description, -length, -count
+#   1 pointer arg, pointer return — e.g. -initWithUTF8String:, +alloc-style
+# Any other selector arity (2+ args, non-pointer args, struct returns,
+# floating-point args) is NOT covered and will call through the wrong
+# signature — likely a crash or garbage result, not silent success.
+type
+  ObjcMsgSend1 = proc(self: pointer, sel: pointer, a1: pointer): pointer {.cdecl.}
+  AutoreleasePoolPushFn = proc(): pointer {.cdecl.}
+  AutoreleasePoolPopFn = proc(token: pointer) {.cdecl.}
 
 proc readGuestString(uc: UcHandle, addr0: uint64, maxLen: int = 4096): string =
-  ## Read a null-terminated string from guest memory, used for open()'s path.
+  ## Read a null-terminated string from guest memory (used for open()'s
+  ## path, and — critically — for translating a guest-space selector
+  ## reference into its real string before asking the host runtime for the
+  ## real SEL, see resolveSel below).
   var buf = newSeq[byte](maxLen)
   if uc_mem_read(uc, addr0, addr buf[0], csize_t maxLen) != 0:
     return ""
@@ -64,6 +83,468 @@ proc readGuestString(uc: UcHandle, addr0: uint64, maxLen: int = 4096): string =
   result = newString(n)
   if n > 0:
     copyMem(addr result[0], addr buf[0], n)
+
+let libobjc = loadLib("/usr/lib/libobjc.A.dylib")
+var objcMsgSendAddr: pointer = nil
+var objcGetClassAddr: pointer = nil
+var selRegisterNameAddr: pointer = nil
+var objcAutoreleasePoolPushAddr: pointer = nil
+var objcAutoreleasePoolPopAddr: pointer = nil
+if libobjc != nil:
+  objcMsgSendAddr = symAddr(libobjc, "objc_msgSend")
+  objcGetClassAddr = symAddr(libobjc, "objc_getClass")
+  selRegisterNameAddr = symAddr(libobjc, "sel_registerName")
+  objcAutoreleasePoolPushAddr = symAddr(libobjc, "objc_autoreleasePoolPush")
+  objcAutoreleasePoolPopAddr = symAddr(libobjc, "objc_autoreleasePoolPop")
+if objcMsgSendAddr == nil and verboseMode:
+  echo "[thunk] warning: could not dlsym real objc_msgSend from libobjc.A.dylib"
+
+# ---- Foundation / CoreFoundation: needed for NSLog and for the
+# compile-time NSConstantString literal's `isa` bind
+# (___CFConstantStringClassReference). Loaded the same way as libobjc
+# above — these are real host frameworks, already present on every macOS
+# system, so no new files/downloads are involved. ----
+let libFoundation = loadLib("/System/Library/Frameworks/Foundation.framework/Foundation")
+let libCF = loadLib("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+var nsLogAddr: pointer = nil
+var cfConstantStringClassAddr: pointer = nil
+if libFoundation != nil:
+  nsLogAddr = symAddr(libFoundation, "NSLog")
+if libCF != nil:
+  # This is the real global CFConstantString class object CoreFoundation
+  # exports; clang's compile-time @"..." literals bind their `isa` field
+  # to exactly this symbol. It's DATA (a pointer value to read), same
+  # shape as _OBJC_CLASS_$_* below, not a function to thunk.
+  cfConstantStringClassAddr = symAddr(libCF, "__CFConstantStringClassReference")
+if verboseMode:
+  if nsLogAddr == nil:
+    echo "[thunk] warning: could not dlsym real NSLog from Foundation"
+  if cfConstantStringClassAddr == nil:
+    echo "[thunk] warning: could not dlsym __CFConstantStringClassReference from CoreFoundation"
+
+let objcFfiReady = initObjcFfi(verboseMode)
+if verboseMode:
+  if objcFfiReady:
+    echo "[thunk] generic libffi + runtime-introspection objc_msgSend path available"
+  else:
+    echo "[thunk] generic libffi path unavailable — falling back to hand-written selector cases only"
+
+type
+  ObjcGetClassFn = proc(name: cstring): pointer {.cdecl.}
+  SelRegisterNameFn = proc(name: cstring): pointer {.cdecl.}
+
+proc resolveSel(uc: UcHandle, guestSelAddr: uint64): pointer =
+  ## The `sel` argument the guest passes is a pointer into GUEST memory
+  ## (Unicorn's own address space) — NOT a valid pointer in the real host
+  ## process. Passing it straight to the real objc_msgSend crashes (this
+  ## was confirmed: SIGSEGV reading a guest-space "pointer" as if it were
+  ## a real host address). Fix: read the actual selector STRING out of
+  ## guest memory ourselves, then ask the REAL host runtime for the real,
+  ## valid SEL via sel_registerName — never pass a guest address to a host
+  ## function expecting a host pointer.
+  if selRegisterNameAddr == nil: return nil
+  let name = readGuestString(uc, guestSelAddr, 256)
+  let fn = cast[SelRegisterNameFn](selRegisterNameAddr)
+  fn(name.cstring)
+
+proc resolveDataSymbol(name: string): tuple[ok: bool, value: uint64] =
+  ## Handles bind symbols that are DATA (a value to be read), not CODE (a
+  ## function to call through the thunk region). Two patterns supported:
+  ##   1. `_OBJC_CLASS_$_<Name>` — every Objective-C class reference the
+  ##      compiler emits — via the REAL host objc_getClass("<Name>").
+  ##   2. `___CFConstantStringClassReference` — the `isa` bind every
+  ##      compile-time @"..." string literal carries, resolved via the
+  ##      REAL host CoreFoundation's own exported class object. Needed so
+  ##      NSLog(@"...", ...) receives a literal whose isa actually points
+  ##      at a valid real class, instead of a dangling guest-space value.
+  ## Either way we hand back a REAL host pointer, so anything built from
+  ## it (msgSend calls, NSLog reading the format's isa, etc.) stays
+  ## consistent with real host-side objects.
+  const objcPrefix = "_OBJC_CLASS_$_"
+  if name.startsWith(objcPrefix) and objcGetClassAddr != nil:
+    let className = name[objcPrefix.len ..< name.len]
+    let fn = cast[ObjcGetClassFn](objcGetClassAddr)
+    let cls = fn(className.cstring)
+    if cls != nil:
+      return (true, cast[uint64](cls))
+  if name == "___CFConstantStringClassReference" and cfConstantStringClassAddr != nil:
+    return (true, cast[uint64](cfConstantStringClassAddr))
+  return (false, 0'u64)
+
+type ThunkProc = proc(uc: UcHandle) {.closure.}
+
+proc thunkReturn(uc: UcHandle, x0: uint64) =
+  var v: culonglong = x0
+  discard uc_reg_write(uc, UC_ARM64_REG_X0, addr v)
+  var lr: culonglong
+  discard uc_reg_read(uc, UC_ARM64_REG_X30, addr lr)
+  var pc: culonglong = lr
+  discard uc_reg_write(uc, UC_ARM64_REG_PC, addr pc)
+
+proc thunkReturnStruct2(uc: UcHandle, w0: uint64, w1: uint64) =
+  ## Same as thunkReturn, but also writes X1 — needed for small (≤16
+  ## byte, no float/double field) struct returns, which AAPCS64 packs
+  ## as raw memory bytes across X0 (bytes 0-7) then X1 (bytes 8-15)
+  ## rather than a single register. See objc_ffi.nim's
+  ## CallGenericResult.retIsStruct for where these words come from.
+  var v0: culonglong = w0
+  discard uc_reg_write(uc, UC_ARM64_REG_X0, addr v0)
+  var v1: culonglong = w1
+  discard uc_reg_write(uc, UC_ARM64_REG_X1, addr v1)
+  var lr: culonglong
+  discard uc_reg_read(uc, UC_ARM64_REG_X30, addr lr)
+  var pc: culonglong = lr
+  discard uc_reg_write(uc, UC_ARM64_REG_PC, addr pc)
+
+proc thunkReturnFloat(uc: UcHandle, bits: uint64) =
+  ## For scalar float/double returns: AAPCS64 returns these in D0, NOT
+  ## X0 — writing X0 instead (as an earlier version of this code did
+  ## implicitly, before float/double return support existed at all)
+  ## would leave the guest reading garbage/stale D0 content. X0 is left
+  ## untouched here deliberately (guest code for a float/double-
+  ## returning call reads D0 only, never X0, so X0's value doesn't matter).
+  var v: culonglong = bits
+  discard uc_reg_write(uc, UC_ARM64_REG_D0, addr v)
+  var lr: culonglong
+  discard uc_reg_read(uc, UC_ARM64_REG_X30, addr lr)
+  var pc: culonglong = lr
+  discard uc_reg_write(uc, UC_ARM64_REG_PC, addr pc)
+
+let thunkTable = {
+  "_getpid": ThunkProc(proc(uc: UcHandle) =
+    thunkReturn(uc, uint64 c_getpid())
+  ),
+  "_malloc": ThunkProc(proc(uc: UcHandle) =
+    var size: culonglong
+    discard uc_reg_read(uc, UC_ARM64_REG_X0, addr size)
+    let p = c_malloc(csize_t size)
+    thunkReturn(uc, cast[uint64](p))
+  ),
+  "_free": ThunkProc(proc(uc: UcHandle) =
+    var p: culonglong
+    discard uc_reg_read(uc, UC_ARM64_REG_X0, addr p)
+    c_free(cast[pointer](uint64 p))
+    thunkReturn(uc, 0)
+  ),
+  "_objc_msgSend": ThunkProc(proc(uc: UcHandle) =
+    ## Two layers, tried in order:
+    ##   1. Generic: ask the REAL host runtime for this selector's actual
+    ##      method signature (method_getReturnType/method_getArgumentType)
+    ##      and marshal the call via libffi accordingly (objc_ffi.nim).
+    ##      Covers pointer/integer/float/double args and returns, and
+    ##      struct returns up to 16 bytes with no float/double field
+    ##      (e.g. NSRange) — see objc_ffi.nim's header comment for the
+    ##      remaining gaps (struct arguments, >16-byte or float-containing
+    ##      struct returns, blocks, unions/arrays, max 6 real args).
+    ##   2. Fallback: the old colon-count heuristic + hand-written cases,
+    ##      used only when (1) reports ok=false — e.g. libffi/runtime
+    ##      unavailable, or a signature outside its documented limits.
+    if objcMsgSendAddr == nil:
+      echo "86arm: objc_msgSend thunk unavailable (libobjc not loaded) — stopping."
+      discard uc_emu_stop(uc)
+    else:
+      var selfPtr, selPtr: culonglong
+      discard uc_reg_read(uc, UC_ARM64_REG_X0, addr selfPtr)
+      discard uc_reg_read(uc, UC_ARM64_REG_X1, addr selPtr)
+      let selName = readGuestString(uc, uint64 selPtr, 256)
+      let realSel = resolveSel(uc, uint64 selPtr)
+
+      var handled = false
+      if objcFfiReady:
+        let genResult = callObjcMsgSendGeneric(
+          uc, objcMsgSendAddr, uint64 selfPtr, realSel, selName,
+          proc(a: uint64): string = readGuestString(uc, a, 4096),
+          proc(sz: csize_t): pointer = c_malloc(sz),
+          proc(p: pointer) = c_free(p)
+        )
+        if genResult.ok:
+          if verboseMode:
+            var lrDbg: culonglong
+            discard uc_reg_read(uc, UC_ARM64_REG_X30, addr lrDbg)
+            if genResult.retIsStruct:
+              echo &"[thunk] objc_msgSend: '{selName}' handled generically via libffi (struct return, {genResult.retSize} bytes), words=({genResult.retWords[0]:#x}, {genResult.retWords[1]:#x}), LR(X30)={uint64(lrDbg):#x}"
+            elif genResult.retIsScalarFloat:
+              echo &"[thunk] objc_msgSend: '{selName}' handled generically via libffi (float/double return -> D0), bits={genResult.retVal:#x}, LR(X30)={uint64(lrDbg):#x}"
+            else:
+              echo &"[thunk] objc_msgSend: '{selName}' handled generically via libffi, retVal={genResult.retVal:#x}, LR(X30)={uint64(lrDbg):#x}"
+          if genResult.retIsStruct:
+            thunkReturnStruct2(uc, genResult.retWords[0], genResult.retWords[1])
+          elif genResult.retIsScalarFloat:
+            thunkReturnFloat(uc, genResult.retVal)
+          else:
+            thunkReturn(uc, genResult.retVal)
+          handled = true
+        elif verboseMode:
+          echo &"[thunk] objc_msgSend: '{selName}' generic path declined ({genResult.reason}) — using fallback"
+
+      if not handled:
+        let colonCount = selName.count(':')
+        if colonCount == 0:
+          let ret = callObjcMsgSendRaw(objcMsgSendAddr, cast[pointer](uint64 selfPtr), realSel, @[])
+          thunkReturn(uc, cast[uint64](ret))
+        elif colonCount == 1 and selName == "stringWithUTF8String:":
+          # The guest passes a pointer to a C string living in GUEST memory
+          # (Unicorn's address space) — not valid in the real host process.
+          # Same translation principle as resolveSel: read the actual bytes
+          # out of guest memory ourselves, copy them into a real host
+          # buffer, and pass THAT pointer to the real host function.
+          var a1: culonglong
+          discard uc_reg_read(uc, UC_ARM64_REG_X2, addr a1)
+          let s = readGuestString(uc, uint64 a1, 4096)
+          let hostBuf = c_malloc(csize_t(s.len + 1))
+          if s.len > 0:
+            copyMem(hostBuf, unsafeAddr s[0], s.len)
+          cast[ptr UncheckedArray[byte]](hostBuf)[s.len] = 0
+          # NOTE: uses callObjcMsgSendRaw (libffi), not a direct
+          # {.cdecl.} function-pointer cast — the direct-cast approach
+          # was observed to return garbage values on at least one real
+          # host, see objc_ffi.nim's callObjcMsgSendRaw doc comment.
+          let ret = callObjcMsgSendRaw(objcMsgSendAddr, cast[pointer](uint64 selfPtr), realSel, @[hostBuf])
+          c_free(hostBuf)
+          thunkReturn(uc, cast[uint64](ret))
+        else:
+          # Unknown 1+-arg selector the generic path also declined: fall
+          # back to the old 0-arg-shape call rather than guess wrong
+          # pointer/value semantics — documented gap, now only reached
+          # for signatures objc_ffi.nim explicitly doesn't support yet
+          # (floats/doubles/structs/blocks/>6 args).
+          if verboseMode:
+            echo &"[thunk] objc_msgSend: selector '{selName}' has no handler — calling as 0-arg shape (may be wrong)"
+          let ret = callObjcMsgSendRaw(objcMsgSendAddr, cast[pointer](uint64 selfPtr), realSel, @[])
+          thunkReturn(uc, cast[uint64](ret))
+  ),
+  "_NSLog": ThunkProc(proc(uc: UcHandle) =
+    ## NSLog(NSString *format, ...) — variadic in its C declaration, but
+    ## that only matters to the CALLEE's own va_arg codegen (already
+    ## compiled and working inside the real host Foundation — we never
+    ## touch that code). At the ABI level, the first N register arguments
+    ## of a variadic call are passed exactly like a normal call; nothing
+    ## special is required on the caller (thunk) side for pointer args
+    ## that fit in registers. test_foundation.m always calls this as
+    ## NSLog(@"%@", s) — exactly 2 pointer args — so casting the real
+    ## host function pointer to a plain 2-arg non-variadic signature and
+    ## calling it that way is valid and avoids needing any va_list
+    ## machinery here at all.
+    if nsLogAddr == nil:
+      echo "86arm: NSLog thunk unavailable (Foundation not loaded) — stopping."
+      discard uc_emu_stop(uc)
+    elif objcMsgSendAddr == nil or objcGetClassAddr == nil or selRegisterNameAddr == nil:
+      echo "86arm: NSLog thunk needs objc_msgSend/objc_getClass/sel_registerName (not loaded) — stopping."
+      discard uc_emu_stop(uc)
+    else:
+      var fmtPtr: culonglong
+      discard uc_reg_read(uc, UC_ARM64_REG_X0, addr fmtPtr)
+      if verboseMode:
+        echo &"[nslog-debug] entry: fmtPtr=0x{uint64(fmtPtr):x}"
+      # fmtPtr points at the compile-time NSConstantString struct — but
+      # that struct physically lives ONLY inside Unicorn's emulated guest
+      # memory arena, which is NOT mapped into the real host process's
+      # address space at that address. Passing fmtPtr straight through to
+      # the real host NSLog (as an earlier version of this thunk did) made
+      # NSLog dereference a bogus host address and SIGSEGV — every
+      # pointer handed to a real host function must point at REAL host
+      # memory, no exceptions, even if the guest struct's bytes "look"
+      # self-contained.
+      #
+      # Fix: read the struct's `str` field ourselves out of guest memory
+      # (struct __NSConstantString_tag { const int *isa; int flags; const
+      # char *str; long length; } — isa@0, flags@8, str@16, length@24;
+      # `str` sits at offset 16 because it's a pointer field needing
+      # 8-byte alignment, forcing 4 bytes of padding after the 4-byte
+      # `flags` field. This exact layout has been stable across Apple's
+      # toolchains for a long time, but is NOT independently re-verified
+      # against current Xcode output in this sandbox — if this ever reads
+      # garbage, dump the 32 bytes at fmtPtr with --trace and check
+      # whether offset 16 really holds a plausible pointer.)
+      var structBytes: array[32, byte]
+      if uc_mem_read(uc, uint64 fmtPtr, addr structBytes[0], csize_t 32) != 0:
+        echo "86arm: NSLog thunk could not read the format literal's struct from guest memory — stopping."
+        discard uc_emu_stop(uc)
+      else:
+        var strFieldGuestAddr: uint64 = 0
+        for i in 0 ..< 8:
+          strFieldGuestAddr = strFieldGuestAddr or (uint64(structBytes[16 + i]) shl (8 * i))
+        if verboseMode:
+          echo &"[nslog-debug] fmtPtr=0x{uint64(fmtPtr):x} extracted str-field guest addr=0x{strFieldGuestAddr:x}"
+        let formatText = readGuestString(uc, strFieldGuestAddr, 4096)
+        if verboseMode:
+          echo &"[nslog-debug] formatText = '{formatText}' (len={formatText.len})"
+        let nsStringCls = cast[ObjcGetClassFn](objcGetClassAddr)("NSString")
+        if verboseMode:
+          echo &"[nslog-debug] nsStringCls = {cast[uint64](nsStringCls):#x}"
+        let sel = cast[SelRegisterNameFn](selRegisterNameAddr)("stringWithUTF8String:")
+        if verboseMode:
+          echo &"[nslog-debug] sel = {cast[uint64](sel):#x}"
+        let hostCBuf = c_malloc(csize_t(formatText.len + 1))
+        if formatText.len > 0:
+          copyMem(hostCBuf, unsafeAddr formatText[0], formatText.len)
+        cast[ptr UncheckedArray[byte]](hostCBuf)[formatText.len] = 0
+        if verboseMode:
+          echo &"[nslog-debug] hostCBuf ready, about to call real objc_msgSend for format NSString..."
+        # NOTE: uses callObjcMsgSendRaw (libffi), not a direct
+        # {.cdecl.} function-pointer cast — see objc_ffi.nim's doc
+        # comment on callObjcMsgSendRaw for why.
+        let realFormatObj = callObjcMsgSendRaw(objcMsgSendAddr, nsStringCls, sel, @[hostCBuf])
+        c_free(hostCBuf)
+        if verboseMode:
+          echo &"[nslog-debug] realFormatObj = {cast[uint64](realFormatObj):#x} — about to call real NSLog..."
+
+        # THE FIX: a real variadic function's OWN va_arg reads route
+        # float/double arguments through the FP register bank (XMM on
+        # x86_64 host, D-regs on arm64 host) — completely separate from
+        # the GP bank pointer/integer arguments use. An earlier version
+        # of this thunk called NSLog through a plain 2-arg {.cdecl.}
+        # function-pointer cast that always placed its one vararg in a
+        # GP register — harmless for %@/%lu (pointer/integer values,
+        # correct bank by luck), but wrong for %f (a double needs XMM,
+        # not GP), producing 0.000000 instead of the real value.
+        #
+        # Fix: parse the REAL format string's conversion specifiers
+        # ourselves (the same information NSLog's own internal va_arg
+        # loop derives) to learn each vararg's real type, read that many
+        # 8-byte stack slots (ARM64's variadic ABI spills ALL varargs to
+        # the stack uniformly regardless of type — confirmed via otool on
+        # every test binary so far, including this one), and call the
+        # real host NSLog via callVariadicHostFn (libffi), which routes
+        # each value through the correct register bank for its real type.
+        var argKinds: seq[VariadicArgKind] = @[]
+        var i = 0
+        while i < formatText.len:
+          if formatText[i] == '%':
+            inc i
+            if i < formatText.len and formatText[i] == '%':
+              inc i  # literal "%%", not a real conversion — skip, no arg
+              continue
+            # Skip flags/width/precision/length-modifier characters;
+            # only the FINAL conversion character matters for picking
+            # a register bank (pointer/GP vs double/FP).
+            while i < formatText.len and formatText[i] notin
+                {'d','i','u','x','X','o','f','F','e','E','g','G','a','A',
+                 'c','s','p','@','n'}:
+              inc i
+            if i < formatText.len:
+              case formatText[i]
+              of 'f', 'F', 'e', 'E', 'g', 'G', 'a', 'A':
+                argKinds.add(vakDouble)
+              else:
+                argKinds.add(vakPointer)
+              inc i
+          else:
+            inc i
+
+        var spVal: culonglong
+        discard uc_reg_read(uc, UC_ARM64_REG_SP, addr spVal)
+        var callArgs: seq[tuple[kind: VariadicArgKind, bits: uint64]] = @[]
+        for idx, kind in argKinds:
+          var slotBytes: array[8, byte]
+          var bits: uint64 = 0
+          if uc_mem_read(uc, uint64(spVal) + uint64(idx * 8), addr slotBytes[0], csize_t 8) == 0:
+            for b in 0 ..< 8:
+              bits = bits or (uint64(slotBytes[b]) shl (8 * b))
+          callArgs.add((kind, bits))
+          if verboseMode:
+            echo &"[nslog-debug] vararg {idx}: kind={kind} bits=0x{bits:x} (from [sp+{idx*8}])"
+
+        var fullArgs = @[(vakPointer, cast[uint64](realFormatObj))]
+        fullArgs.add(callArgs)
+        let ok = callVariadicHostFn(nsLogAddr, fullArgs)
+        if verboseMode:
+          echo &"[nslog-debug] real NSLog call via libffi returned ok={ok}"
+        thunkReturn(uc, 0)
+  ),
+  "_objc_msgSend$1arg": ThunkProc(proc(uc: UcHandle) =
+    ## Not a real symbol name — not currently reachable from the bind
+    ## table (dyld only ever emits one `_objc_msgSend` bind regardless of
+    ## call-site arity), kept here to show the 1-arg shape exists and is
+    ## ready to be wired up once selector-aware dispatch is added.
+    if objcMsgSendAddr == nil:
+      discard uc_emu_stop(uc)
+    else:
+      var selfPtr, selPtr, a1: culonglong
+      discard uc_reg_read(uc, UC_ARM64_REG_X0, addr selfPtr)
+      discard uc_reg_read(uc, UC_ARM64_REG_X1, addr selPtr)
+      discard uc_reg_read(uc, UC_ARM64_REG_X2, addr a1)
+      let realSel = resolveSel(uc, uint64 selPtr)
+      # NOTE: a1 is passed through as-is — if the real call's argument is
+      # itself a guest-space pointer (e.g. a C string for
+      # initWithUTF8String:), this will crash the same way selPtr did
+      # before resolveSel. Not fixed yet; needs the same kind of
+      # translation, chosen per-selector once real signature lookup exists.
+      let fn = cast[ObjcMsgSend1](objcMsgSendAddr)
+      let ret = fn(cast[pointer](uint64 selfPtr), realSel, cast[pointer](uint64 a1))
+      thunkReturn(uc, cast[uint64](ret))
+  ),
+  "_objc_autoreleasePoolPush": ThunkProc(proc(uc: UcHandle) =
+    ## Called with 0 args, returns an opaque "pool token" pointer that
+    ## must later be handed back unchanged to objc_autoreleasePoolPop.
+    ## It's a real host pointer end to end — the guest never dereferences
+    ## it itself, just carries it around and passes it back — so no
+    ## guest<->host translation is needed here at all, unlike selector
+    ## strings or C-string arguments.
+    if objcAutoreleasePoolPushAddr == nil:
+      echo "86arm: objc_autoreleasePoolPush thunk unavailable (libobjc not loaded) — stopping."
+      discard uc_emu_stop(uc)
+    else:
+      let fn = cast[AutoreleasePoolPushFn](objcAutoreleasePoolPushAddr)
+      let token = fn()
+      thunkReturn(uc, cast[uint64](token))
+  ),
+  "_objc_autoreleasePoolPop": ThunkProc(proc(uc: UcHandle) =
+    if objcAutoreleasePoolPopAddr == nil:
+      echo "86arm: objc_autoreleasePoolPop thunk unavailable (libobjc not loaded) — stopping."
+      discard uc_emu_stop(uc)
+    else:
+      var tokenPtr: culonglong
+      discard uc_reg_read(uc, UC_ARM64_REG_X0, addr tokenPtr)
+      let fn = cast[AutoreleasePoolPopFn](objcAutoreleasePoolPopAddr)
+      fn(cast[pointer](uint64 tokenPtr))
+      thunkReturn(uc, 0)
+  ),
+}.toTable
+
+var thunkSlotName: Table[uint64, string]  # thunk slot address -> symbol name, filled per-load
+
+proc onThunkCode(uc: UcHandle, address: culonglong, size: uint32, userData: pointer) {.cdecl.} =
+  let addr0 = uint64(address)
+  if thunkSlotName.hasKey(addr0):
+    let name = thunkSlotName[addr0]
+    if thunkTable.hasKey(name):
+      if verboseMode:
+        var lrDbg: culonglong
+        discard uc_reg_read(uc, UC_ARM64_REG_X30, addr lrDbg)
+        echo &"[thunk] calling real host function for {name} (thunk-slot pc=0x{addr0:x}, LR(X30)=0x{uint64(lrDbg):x})"
+      thunkTable[name](uc)
+    else:
+      echo &"86arm: hit thunk slot for '{name}' but no host implementation is wired up for it yet — stopping."
+      discard uc_emu_stop(uc)
+
+proc onCode(uc: UcHandle, address: culonglong, size: uint32, userData: pointer) {.cdecl.} =
+  inc traceCount
+  if traceCount <= traceMax:
+    echo &"[trace] pc=0x{uint64(address):x} size={size}"
+  elif traceCount == traceMax + 1:
+    echo &"[trace] ... stopping trace output after {traceMax} instructions"
+
+const ReturnFromMainSentinel: uint64 = 0x0000dead_00000000'u64
+  ## A `ret` at the end of a real `int main()`-style binary jumps to
+  ## whatever address was in X30/LR when execution reached main — but our
+  ## loader jumps straight to the entry point with no real crt/dyld caller
+  ## to have set that up first, so X30 previously held garbage/zero,
+  ## making the final `ret` look like a scary generic fault at addr=0x0
+  ## even on a fully successful run (all real output had already printed
+  ## correctly by that point — see test_foundation.m/test_nsarray.m runs).
+  ## Writing this recognizable, deliberately-unmapped sentinel into X30
+  ## before starting emulation lets onMemUnmapped tell "the program
+  ## finished and returned from main, as expected" apart from an actual
+  ## unexpected fault elsewhere.
+
+proc onMemUnmapped(uc: UcHandle, memType: cint, address: culonglong,
+                    size: cint, value: clonglong, userData: pointer): bool {.cdecl.} =
+  if uint64(address) == ReturnFromMainSentinel:
+    echo "[load] process returned normally from main (reached the return-address sentinel, as expected for a real `int main()` binary with no real crt/dyld caller)."
+  elif verboseMode:
+    echo &"[fault] unmapped memory access — type={memType} addr=0x{uint64(address):x} size={size}"
+  return false  # do not resolve it; let uc_emu_start return the real error after logging
 
 proc onIntr(uc: UcHandle, intno: uint32, userData: pointer) {.cdecl.} =
   if intno != 2'u32:   # EXCP_SWI on ARM64 in QEMU/Unicorn = 2
@@ -198,11 +679,13 @@ proc onIntr(uc: UcHandle, intno: uint32, userData: pointer) {.cdecl.} =
       discard uc_emu_stop(uc)
 
     else:
-      echo &"[emu] untranslated XNU syscall number {syscallNo} — stopping (not in the translation table)"
+      if verboseMode:
+        echo &"[emu] untranslated XNU syscall number {syscallNo} — stopping (not in the translation table)"
       discard uc_emu_stop(uc)
 
   except CatchableError as e:
-    echo "[emu] internal error while handling syscall: ", e.msg
+    if verboseMode:
+      echo "[emu] internal error while handling syscall: ", e.msg
     discard uc_emu_stop(uc)
 
 proc newEngine(): UcHandle =
@@ -263,6 +746,28 @@ proc runHello() =
 
 proc runLoad(path: string, trace: bool = false) =
   let info = parseMachO(path)
+  let dylibs = listImports(path)
+  let fixups = parseChainedFixups(info)
+  let bound = fixups.binds
+  let rebases = fixups.rebases
+  var thunkedCount = 0
+  var unthunkedNames: seq[string]
+  var dataResolvableCount = 0
+  if bound.len > 0:
+    for b in bound:
+      if thunkTable.hasKey(b.symbolName):
+        inc thunkedCount
+      elif resolveDataSymbol(b.symbolName).ok:
+        inc dataResolvableCount
+      elif b.symbolName notin unthunkedNames:
+        unthunkedNames.add(b.symbolName)
+    if verboseMode:
+      echo &"[bind] {bound.len} bound symbols from {dylibs.len} dylib(s); {thunkedCount} code thunk(s), {dataResolvableCount} data symbol(s) resolvable."
+      if unthunkedNames.len > 0:
+        echo &"  not resolvable yet (will crash if actually used): {unthunkedNames.join(\", \")}"
+      if rebases.len > 0:
+        echo &"[rebase] {rebases.len} internal pointer(s) to fix up (selectors, vtables, string refs, ...)"
+
   if verboseMode:
     echo &"[load] {info.segments.len} segments, entry file-offset = 0x{info.entryOffset:x}"
 
@@ -331,8 +836,66 @@ proc runLoad(path: string, trace: bool = false) =
   var sp: culonglong = stackBase + StackSize - 0x10
   discard uc_reg_write(uc, UC_ARM64_REG_SP, addr sp)
 
+  # ---- apply rebase fixups: internal pointer slots (Objective-C selector
+  # refs, vtables, string pointers...) whose raw bytes are just encoded
+  # chain data until corrected to the real in-image address.
+  for r in rebases:
+    var v: uint64 = r.targetVmaddr
+    discard uc_mem_write(uc, r.address, addr v, 8)
+  if verboseMode and rebases.len > 0:
+    echo &"[rebase] applied {rebases.len} internal pointer fixup(s)"
+
+  # ---- patch DATA bind symbols directly (e.g. _OBJC_CLASS_$_NSObject): the
+  # GOT slot gets the real resolved value itself, not a thunk trampoline —
+  # these are read as values, never branched into.
+  for b in bound:
+    let resolved = resolveDataSymbol(b.symbolName)
+    if resolved.ok:
+      var v: uint64 = resolved.value
+      discard uc_mem_write(uc, b.address, addr v, 8)
+      if verboseMode:
+        echo &"[bind] {b.symbolName} -> real host value 0x{resolved.value:x} (GOT slot 0x{b.address:x} patched)"
+
+  # ---- real thunking: for every bound symbol we have a host implementation
+  # for, patch its GOT slot to point at a dedicated "thunk slot" address
+  # instead of leaving it at 0 (unresolved). When the guest calls through
+  # that GOT slot (a normal `ldr`+`br` stub the compiler already emits for
+  # any external call), execution lands in our thunk region; onThunkCode
+  # intercepts it, calls the REAL host libSystem function, and returns.
+  if thunkedCount > 0:
+    let rawThunkSize = uint64(bound.len) * ThunkSlotSize
+    let thunkRegionSize = (rawThunkSize + 0xFFF'u64) and not 0xFFF'u64  # uc_mem_map requires page-aligned size
+    checkErr(uc, uc_mem_map(uc, ThunkBase, csize_t thunkRegionSize, uint32(UC_PROT_READ or UC_PROT_EXEC)), "map thunk region")
+    # Fill with `ret` (0xD65F03C0) so that if a slot is ever reached without
+    # being redirected by the hook first, it fails safely (returns) instead
+    # of executing garbage.
+    var retInstr: array[4, byte] = [0xC0'u8, 0x03, 0x5F, 0xD6]
+    var slotIdx = 0
+    for b in bound:
+      if thunkTable.hasKey(b.symbolName):
+        let slotAddr = ThunkBase + uint64(slotIdx) * ThunkSlotSize
+        discard uc_mem_write(uc, slotAddr, addr retInstr[0], 4)
+        thunkSlotName[slotAddr] = b.symbolName
+        # patch the GOT slot itself (b.address) to point at our thunk slot
+        var slotVal: uint64 = slotAddr
+        discard uc_mem_write(uc, b.address, addr slotVal, 8)
+        if verboseMode:
+          echo &"[bind] {b.symbolName} -> thunk slot 0x{slotAddr:x} (GOT slot 0x{b.address:x} patched)"
+        inc slotIdx
+
+    var thunkHook: UcHook
+    checkErr(uc, uc_hook_add_code(uc, addr thunkHook, UC_HOOK_CODE, onThunkCode, nil,
+                                   culonglong ThunkBase, culonglong(ThunkBase + thunkRegionSize)),
+             "hook_add_thunk")
+
   if verboseMode:
     echo &"[load] jumping to entry 0x{entryAddr:x} — if the binary needs dyld/libSystem, it will stop at the first unsupported syscall/instruction."
+  # See ReturnFromMainSentinel's comment: give a real `int main()`-style
+  # binary's final `ret` somewhere recognizable to jump to, instead of
+  # whatever garbage/zero X30 happened to hold, so a clean finish doesn't
+  # print like a scary unexpected fault.
+  var lrSentinel: culonglong = ReturnFromMainSentinel
+  discard uc_reg_write(uc, UC_ARM64_REG_X30, addr lrSentinel)
   # NOTE: passing until=0 is a known Unicorn quirk that can make emulation
   # stop prematurely/unpredictably (see unicorn-engine issue reports on
   # "emulation stops when address 0 is reached" even though 0 was only meant
@@ -341,28 +904,79 @@ proc runLoad(path: string, trace: bool = false) =
   # address that's unreachable in practice instead of 0.
   const Sentinel: culonglong = 0xFFFFFFFFFFFFFFFF'u64
   let err = uc_emu_start(uc, entryAddr, Sentinel, 0, 0)
+  var pcAtStop: culonglong
+  discard uc_reg_read(uc, UC_ARM64_REG_PC, addr pcAtStop)
+  let cleanReturnFromMain = (err != 0) and (uint64(pcAtStop) == ReturnFromMainSentinel)
   if verboseMode:
-    echo &"[load] uc_emu_start returned: {err} ({$uc_strerror(err)})"
-  elif err != 0:
-    # even in quiet mode, a real failure should not be silent
-    echo &"86arm: emulation stopped with an error ({$uc_strerror(err)})"
-
-when isMainModule:
-  var args = commandLineParams()
-  if args.len == 0:
-    echo "Usage: 86arm [--verbose] [--trace] <arm64-file>   (or: 86arm --hello for the built-in demo)"
-  elif args[0] == "--hello":
-    runHello()
-  else:
-    var trace = false
-    while args.len > 0 and (args[0] == "--verbose" or args[0] == "--trace"):
-      if args[0] == "--verbose": verboseMode = true
-      if args[0] == "--trace":
-        trace = true
-        verboseMode = true  # tracing without the surrounding load/exit context is not very useful
-      args = args[1..^1]
-    if args.len == 0:
-      echo "Usage: 86arm [--verbose] [--trace] <arm64-file>"
+    if cleanReturnFromMain:
+      echo &"[load] uc_emu_start returned: {err} ({$uc_strerror(err)}) — expected: this is the return-from-main sentinel, not a real error."
     else:
-      # main syntax: 86arm <arm64-file>
-      runLoad(args[0], trace = trace)
+      echo &"[load] uc_emu_start returned: {err} ({$uc_strerror(err)})"
+  elif err != 0 and not cleanReturnFromMain:
+    if verboseMode:
+      echo &"86arm: emulation stopped with an error ({$uc_strerror(err)})"
+
+# ---- actual program entry point (was incorrectly nested inside
+# runNativeBridge, as dead code after its `result` assignment — that meant
+# NOTHING here ever ran, so every invocation of the compiled binary
+# silently did nothing and exited 0 with zero output). Moved to top-level
+# so it's Nim's real main.
+#
+# The old needsNativeBridge()/runNativeBridge() cputype-spoof + libaah86
+# fault-capture path has been removed: it never got past its own
+# documented stub (aah86_emulate_at() always just printed a message and
+# _exit(70)), and every binary in this project's own test suite is now
+# fully covered by the hand-wired thunk table + resolveDataSymbol above
+# (including Foundation/NSLog, see the _NSLog thunk and the
+# ___CFConstantStringClassReference case). If a future binary binds a
+# symbol neither of those recognizes, onThunkCode already fails loudly
+# and safely (see its `else` branch) instead of silently doing nothing —
+# no separate bridge path is needed for that either. ----
+var args = commandLineParams()
+if args.len == 0:
+  echo "Usage: 86arm [--verbose] [--trace] <arm64-file>   (or: 86arm --hello for the built-in demo)"
+elif args[0] == "--hello":
+  runHello()
+elif args[0] == "--deps" and args.len >= 2:
+  let info = parseMachO(args[1])
+  let dylibs = listImports(args[1])
+  if dylibs.len == 0:
+    echo "No LC_LOAD_DYLIB dependencies (fully static binary)."
+  else:
+    echo "Dylib dependencies:"
+    for imp in dylibs:
+      echo "  ", imp.fromDylib
+    echo ""
+    let fixups = parseChainedFixups(info)
+    let bound = fixups.binds
+    if bound.len == 0:
+      if info.hasClassicBindInfo:
+        echo "No LC_DYLD_CHAINED_FIXUPS found — this binary uses the OLDER classic bind-opcode format (LC_DYLD_INFO/LC_DYLD_INFO_ONLY) instead, which this parser doesn't read yet. Try a newer deployment target (e.g. -target arm64-apple-macos12 or later) to get chained fixups."
+      else:
+        echo "No LC_DYLD_CHAINED_FIXUPS bind entries found (fully static, or no dynamic symbols at all)."
+    else:
+      echo &"{bound.len} bound symbols (address -> symbol, from dylib ordinal):"
+      for b in bound:
+        echo &"  0x{b.address:x}  {b.symbolName}  (lib ordinal {b.libOrdinal})"
+    if fixups.rebases.len > 0:
+      echo &"\n{fixups.rebases.len} internal rebase pointer(s) (selectors, vtables, string refs, ...)"
+else:
+  var trace = false
+  while args.len > 0 and (args[0] == "--verbose" or args[0] == "--trace"):
+    if args[0] == "--verbose": verboseMode = true
+    if args[0] == "--trace":
+      trace = true
+      verboseMode = true  # tracing without the surrounding load/exit context is not very useful
+    args = args[1..^1]
+  if args.len == 0:
+    echo "Usage: 86arm [--verbose] [--trace] <arm64-file>"
+  else:
+    # main syntax: 86arm <arm64-file>
+    # Self-contained loader + hand-wired thunk table handles everything
+    # this project's test suite links against, including Foundation (see
+    # the _NSLog thunk and ___CFConstantStringClassReference above). A
+    # binary that binds something neither covers will simply stop with a
+    # clear message from onThunkCode when it's first reached — no
+    # separate native-bridge dispatch needed.
+    discard parseMachO(args[0])  # currently unused here, but validates the file is a real Mach-O early
+    runLoad(args[0], trace = trace)

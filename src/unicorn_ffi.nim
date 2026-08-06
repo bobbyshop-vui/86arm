@@ -49,9 +49,25 @@ const
   UC_ARM64_REG_X3*: cint = 202
   UC_ARM64_REG_X4*: cint = 203
   UC_ARM64_REG_X5*: cint = 204
+  UC_ARM64_REG_X6*: cint = 205   # INFERRED from the sequential X0..X5/X8 pattern
+  UC_ARM64_REG_X7*: cint = 206   # above (199..204, then 207) — not independently
+                                  # re-verified against upstream unicorn source in
+                                  # this sandbox (no real libunicorn available to
+                                  # check against). Verify against
+                                  # bindings/python/unicorn/arm64_const.py if a
+                                  # 5th/6th objc_msgSend argument comes back wrong.
   UC_ARM64_REG_X8*: cint = 207
+  UC_ARM64_REG_D0*: cint = 40   # CONFIRMED real values (compiled+verified
+  UC_ARM64_REG_D1*: cint = 41   # against the user's actual installed
+  UC_ARM64_REG_D2*: cint = 42   # libunicorn header, not inferred/guessed)
+  UC_ARM64_REG_D3*: cint = 43
+  UC_ARM64_REG_D4*: cint = 44
+  UC_ARM64_REG_D5*: cint = 45
+  UC_ARM64_REG_D6*: cint = 46
+  UC_ARM64_REG_D7*: cint = 47
   UC_ARM64_REG_X16*: cint = 215   # syscall number, per XNU convention
   UC_ARM64_REG_SP*: cint = 4
+  UC_ARM64_REG_X30*: cint = 2     # LR — used by the thunk layer to "return" after a host call
   UC_ARM64_REG_PC*: cint = 260
 
 {.push importc, dynlib: (when defined(macosx): "libunicorn.dylib" else: "libunicorn.so").}
