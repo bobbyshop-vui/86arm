@@ -58,7 +58,7 @@
 ##     wrong (and likely a crash inside the real implementation) if the
 ##     guest meant to pass a pointer to guest-local memory.
 
-import std/[strformat, dynlib]
+import std/[strformat, strutils, dynlib]
 import unicorn_ffi
 
 proc c_malloc(size: csize_t): pointer {.importc: "malloc", header: "<stdlib.h>".}
@@ -121,6 +121,8 @@ var ffi_type_float: pointer = nil
 var ffi_type_double: pointer = nil
 var ffiPrepCifAddr: pointer = nil
 var ffiCallAddr: pointer = nil
+var ffiClosureAllocAddr: pointer = nil
+var ffiPrepClosureLocAddr: pointer = nil
 
 type FfiPrepCifFn = proc(cif: pointer, abi: cuint, nargs: cuint, rtype: pointer, atypes: pointer): cint {.cdecl.}
 type FfiCallFn = proc(cif: pointer, fn: pointer, rvalue: pointer, avalue: pointer) {.cdecl.}
@@ -148,6 +150,8 @@ proc loadLibffi(): bool =
   ffi_type_double = symAddr(libffiHandle, "ffi_type_double")
   ffiPrepCifAddr = symAddr(libffiHandle, "ffi_prep_cif")
   ffiCallAddr = symAddr(libffiHandle, "ffi_call")
+  ffiClosureAllocAddr = symAddr(libffiHandle, "ffi_closure_alloc")
+  ffiPrepClosureLocAddr = symAddr(libffiHandle, "ffi_prep_closure_loc")
   result = ffi_type_pointer != nil and ffiPrepCifAddr != nil and ffiCallAddr != nil
 
 proc ffi_prep_cif(cif: pointer, abi: cuint, nargs: cuint, rtype: pointer, atypes: pointer): cint =
@@ -395,19 +399,101 @@ proc ffiTypeAndKindForEncodingFull(rawEnc: string): tuple[ok: bool, ty: pointer,
   let r = parseEncodedType(rawEnc, pos)
   (r.ok, r.ty, r.isCString, r.hasFloat)
 
+
+# ---- AAPCS64 helpers for struct-by-value arguments/returns -------------------
+#
+# The GUEST is arm64 (AAPCS64), the HOST is x86_64 (SysV). libffi handles the
+# HOST side of struct passing for us; what we must do ourselves is decode the
+# GUEST side: where did the arm64 caller put the struct's bytes?
+#   - Homogeneous Floating-point Aggregate (HFA: 1..4 members, all float or all
+#     double)           -> one FP register (D0..D7) per member
+#   - other, size <= 16 -> packed into 1-2 consecutive GP registers
+#   - size > 16         -> caller passes a POINTER (in a GP reg) to a copy
+# Struct RETURNS follow the same split, except >16 bytes uses the hidden X8
+# pointer ("indirect result") rather than a register.
+
+proc leafChars(enc: string, pos: var int, outp: var seq[char]) =
+  ## Flattens an @encode string into its scalar leaf type characters.
+  skipQualifierChars(enc, pos)
+  if pos >= enc.len: return
+  case enc[pos]
+  of '{':
+    inc pos
+    while pos < enc.len and enc[pos] notin {'=', '}'}: inc pos
+    if pos < enc.len and enc[pos] == '=': inc pos
+    while pos < enc.len and enc[pos] != '}':
+      skipQuotedFieldName(enc, pos)
+      if pos >= enc.len or enc[pos] == '}': break
+      leafChars(enc, pos, outp)
+    if pos < enc.len: inc pos
+  of '^':
+    inc pos
+    var tmp: seq[char]
+    leafChars(enc, pos, tmp)
+    outp.add('^')
+  else:
+    outp.add(enc[pos])
+    inc pos
+
+proc hfaInfo(enc: string): tuple[isHfa: bool, count: int, elemSize: int] =
+  var pos = 0
+  var leaves: seq[char]
+  leafChars(enc, pos, leaves)
+  if leaves.len < 1 or leaves.len > 4: return (false, 0, 0)
+  let c0 = leaves[0]
+  if c0 != 'f' and c0 != 'd': return (false, 0, 0)
+  for c in leaves:
+    if c != c0: return (false, 0, 0)
+  (true, leaves.len, (if c0 == 'f': 4 else: 8))
+
+proc structSizeOf(ty: pointer): int =
+  ## libffi only fills in a struct ffi_type's size/alignment inside
+  ## ffi_prep_cif — run a throwaway cif over it to make it compute them.
+  var cif = newString(FfiCifBufSize)
+  var t = ty
+  discard ffi_prep_cif(cif.cstring, FFI_DEFAULT_ABI, 1, ffi_type_void, addr t)
+  int(cast[ptr FfiTypeRaw](ty).size)
+
+proc callHostPtrFn*(fnAddr: pointer, args: seq[uint64]): uint64 =
+  ## Calls a real host function taking N pointer-sized integer arguments and
+  ## returning a pointer-sized value (objc_alloc, objc_retain, ...), via libffi.
+  if not runtimeReady: return 0
+  let n = args.len
+  var types = newSeq[pointer](n)
+  var storage = newSeq[uint64](n)
+  var valPtrs = newSeq[pointer](n)
+  for i in 0 ..< n:
+    types[i] = ffi_type_pointer
+    storage[i] = args[i]
+  for i in 0 ..< n: valPtrs[i] = addr storage[i]
+  var cifBuf = newString(FfiCifBufSize)
+  if ffi_prep_cif(cifBuf.cstring, FFI_DEFAULT_ABI, cuint(n), ffi_type_pointer,
+                  (if n > 0: addr types[0] else: nil)) != 0:
+    return 0
+  var ret: uint64 = 0
+  ffi_call(cifBuf.cstring, fnAddr, addr ret, (if n > 0: addr valPtrs[0] else: nil))
+  ret
+
 type
   CallGenericResult* = object
     ok*: bool
     retVal*: uint64
     retIsStruct*: bool
-      ## When true, the caller must write BOTH retWords[0] into X0 AND
-      ## retWords[1] into X1 (per AAPCS64's rule for small, ≤16-byte,
-      ## non-HFA struct returns) instead of just retVal into X0.
+      ## Small (<=16 byte), non-HFA struct return: write retWords[0] -> X0,
+      ## retWords[1] -> X1.
     retWords*: array[2, uint64]
-    retSize*: int  # only meaningful when retIsStruct
+    retSize*: int  # only meaningful when retIsStruct / retIsHfa / retIndirect
     retIsScalarFloat*: bool
-      ## When true, the caller must write retVal's raw bits into D0
-      ## (not X0) — see thunkReturnFloat in main.nim.
+      ## Scalar float/double return: write retVal's bits into D0.
+    retIsHfa*: bool
+      ## HFA struct return: member k goes into Dk (retBytes holds the
+      ## members back to back, each retHfaElemSize bytes).
+    retHfaCount*: int
+    retHfaElemSize*: int
+    retIndirect*: bool
+      ## >16 byte struct return: the guest's X8 holds the address of a guest
+      ## buffer that must receive retBytes.
+    retBytes*: seq[byte]
     reason*: string  # only meaningful when ok == false, for --verbose logging
 
 proc readGpArgReg(uc: UcHandle, idx: int): uint64 =
@@ -440,6 +526,8 @@ proc readFpArgReg(uc: UcHandle, idx: int): uint64 =
   else: v = 0
   uint64(v)
 
+type ArgKind = enum akScalar, akStruct
+
 proc callObjcMsgSendGeneric*(
   uc: UcHandle,
   objcMsgSendAddr: pointer,
@@ -449,22 +537,19 @@ proc callObjcMsgSendGeneric*(
   readGuestString: proc(addr0: uint64): string,
   cMalloc: proc(size: csize_t): pointer,
   cFree: proc(p: pointer),
+  translateObj: proc(a: uint64): uint64 = nil,
+  translateSel: proc(a: uint64): uint64 = nil,
+  readGuestBytes: proc(a: uint64, n: int): seq[byte] = nil,
 ): CallGenericResult =
-  ## Attempts a fully generic objc_msgSend call using the real runtime's
-  ## own method signature. Returns ok=false (never touches Unicorn/guest
-  ## state itself) if the signature can't be handled generically yet
-  ## (structs-as-arguments, >16-byte or float-containing struct returns,
-  ## too many args, method not found...) so the caller can fall back to
-  ## its own hand-written special cases instead.
+  ## Fully generic objc_msgSend using the real runtime's own method
+  ## signature. Returns ok=false (never touching guest state) if the
+  ## signature can't be handled so the caller can fall back.
   ##
-  ## Reads argument registers ITSELF (rather than being handed a
-  ## pre-read array) because AAPCS64 tracks general-purpose (X2-X7) and
-  ## floating-point (D0-D7) argument registers as two INDEPENDENT
-  ## counters — the Nth float/double argument goes in D(n), regardless
-  ## of how many integer/pointer arguments came before it. Which bank
-  ## (and which slot within it) argument i uses can only be known once
-  ## we've asked the runtime for argument i's real type, so register
-  ## selection has to happen argument-by-argument here, not ahead of time.
+  ## Guest->host translation hooks (all optional):
+  ##   translateObj: object ('@') args that are guest-memory objects (e.g.
+  ##                 compile-time @"..." literals) -> real host objects
+  ##   translateSel: SEL (':') args (guest selector refs) -> real host SELs
+  ##   readGuestBytes: needed for structs > 16 bytes passed by reference
   result = CallGenericResult(ok: false, retVal: 0, reason: "")
   if not runtimeReady:
     result.reason = "libffi/objc runtime not available"
@@ -485,6 +570,7 @@ proc callObjcMsgSendGeneric*(
     result.reason = &"unsupported arg count {realArgCount} (only 0..6 supported)"
     return
 
+  # ---- return type ----
   var retBuf = newString(64)
   method_getReturnType_rt(meth, retBuf.cstring, csize_t 64)
   let retEnc = $(retBuf.cstring)
@@ -504,67 +590,92 @@ proc callObjcMsgSendGeneric*(
     retIsStruct = qpos < retEnc.len and retEnc[qpos] == '{'
     retHasFloat = rinfo.hasFloat
     retIsScalarFloat = (not retIsStruct) and retHasFloat
-    if retIsStruct and retHasFloat:
-      # AAPCS64 returns small structs containing any float/double field
-      # via the FP register bank (D0/D1, or packs differently for HFAs)
-      # rather than X0/X1 — not wired up yet (same D-register gap as
-      # scalar float/double args/returns, see this file's header comment).
-      result.reason = &"struct return type '{retEnc}' contains a float/double field — needs FP registers, not supported yet"
-      return
 
-  # ---- gather + marshal each real argument ----
-  var margs = newSeq[MarshalArg](realArgCount)
+  # ---- argument types (pass 1) ----
   var argTypes = newSeq[pointer](realArgCount)
-  var nextGp = 2   # X2 is the first available GP argument register
-  var nextFp = 0   # D0 is the first available FP argument register
+  var argEncs = newSeq[string](realArgCount)
+  var argKinds = newSeq[ArgKind](realArgCount)
+  var argCStr = newSeq[bool](realArgCount)
+  var argHasFloat = newSeq[bool](realArgCount)
   for i in 0 ..< realArgCount:
     var argBuf = newString(64)
     method_getArgumentType_rt(meth, cuint(i + 2), argBuf.cstring, csize_t 64)
     let enc = $(argBuf.cstring)
-    var qpos = 0
-    var qenc = enc
-    while qpos < qenc.len and qenc[qpos] in {'r', 'n', 'N', 'o', 'O', 'R', 'V'}: inc qpos
-    if qpos < qenc.len and qenc[qpos] == '{':
-      # Struct-BY-VALUE arguments need real AAPCS64 register packing
-      # (1-2 GP/FP registers depending on size/field composition, or
-      # pass-by-reference for >16 bytes) that this project's current
-      # one-register-per-argument-slot marshaling does not implement.
-      # Struct RETURN types are supported (see below) since that's a
-      # narrower, safely-scoped problem; struct ARGUMENTS remain an
-      # explicit decline rather than silently passing the wrong bytes.
-      for j in 0 ..< i:
-        if margs[j].hostBufToFree != nil: cFree(margs[j].hostBufToFree)
-      result.reason = &"arg {i} is a struct-by-value type ('{enc}') — not supported as an argument yet (register-packing not implemented), only as a return type"
-      return
+    argEncs[i] = enc
     let info = ffiTypeAndKindForEncodingFull(enc)
-    if not info.ok:
-      for j in 0 ..< i:
-        if margs[j].hostBufToFree != nil: cFree(margs[j].hostBufToFree)
+    if not info.ok or enc.contains("@?"):
       result.reason = &"unsupported arg {i} type encoding '{enc}'"
       return
+    argTypes[i] = info.ty
+    argCStr[i] = info.isCString
+    argHasFloat[i] = info.hasFloat
+    var qpos = 0
+    while qpos < enc.len and enc[qpos] in {'r', 'n', 'N', 'o', 'O', 'R', 'V'}: inc qpos
+    argKinds[i] = (if qpos < enc.len and enc[qpos] == '{': akStruct else: akScalar)
+
+  # ---- marshal argument VALUES (pass 2) ----
+  var margs = newSeq[MarshalArg](realArgCount)
+  var structBufs = newSeq[seq[byte]](realArgCount)
+  var nextGp = 2   # X2 is the first available GP argument register
+  var nextFp = 0   # D0 is the first available FP argument register
+
+  template cleanupAndFail(msg: string) =
+    for j in 0 ..< realArgCount:
+      if margs[j].hostBufToFree != nil: cFree(margs[j].hostBufToFree)
+    result.reason = msg
+    return
+
+  for i in 0 ..< realArgCount:
+    let enc = argEncs[i]
+    if argKinds[i] == akStruct:
+      let sz = structSizeOf(argTypes[i])
+      var buf = newSeq[byte](max(sz, 16))
+      let h = hfaInfo(enc)
+      if h.isHfa:
+        if nextFp + h.count > 8:
+          cleanupAndFail(&"arg {i} ('{enc}'): HFA ran out of FP registers")
+        for k in 0 ..< h.count:
+          let bits = readFpArgReg(uc, nextFp + k)
+          for b in 0 ..< h.elemSize:
+            buf[k * h.elemSize + b] = byte((bits shr (8 * b)) and 0xFF)
+        nextFp += h.count
+      elif sz <= 16:
+        let words = (sz + 7) div 8
+        if nextGp + words > 8:
+          cleanupAndFail(&"arg {i} ('{enc}'): struct ran out of GP registers")
+        for w in 0 ..< words:
+          let bits = readGpArgReg(uc, nextGp + w)
+          for b in 0 ..< 8:
+            buf[w * 8 + b] = byte((bits shr (8 * b)) and 0xFF)
+        nextGp += words
+      else:
+        if nextGp > 7 or readGuestBytes == nil:
+          cleanupAndFail(&"arg {i} ('{enc}'): large struct needs a GP register + guest memory reader")
+        let p = readGpArgReg(uc, nextGp)
+        inc nextGp
+        let bytes = readGuestBytes(p, sz)
+        if bytes.len != sz:
+          cleanupAndFail(&"arg {i} ('{enc}'): could not read {sz} bytes of struct from guest memory")
+        for b in 0 ..< sz: buf[b] = bytes[b]
+      structBufs[i] = buf
+      continue
+
     var rawVal: uint64
-    if info.hasFloat:
+    if argHasFloat[i]:
       if nextFp > 7:
-        for j in 0 ..< i:
-          if margs[j].hostBufToFree != nil: cFree(margs[j].hostBufToFree)
-        result.reason = &"arg {i}: ran out of FP argument registers (D0-D7 all used)"
-        return
+        cleanupAndFail(&"arg {i}: ran out of FP argument registers (D0-D7 all used)")
       rawVal = readFpArgReg(uc, nextFp)
       inc nextFp
     else:
       if nextGp > 7:
-        for j in 0 ..< i:
-          if margs[j].hostBufToFree != nil: cFree(margs[j].hostBufToFree)
-        result.reason = &"arg {i}: ran out of GP argument registers (X2-X7 all used)"
-        return
+        cleanupAndFail(&"arg {i}: ran out of GP argument registers (X2-X7 all used)")
       rawVal = readGpArgReg(uc, nextGp)
       inc nextGp
     var m = MarshalArg(storage: rawVal, hostBufToFree: nil)
-    if info.isCString:
-      # rawVal is a GUEST address — read the real bytes ourselves and
-      # hand the real implementation a real host buffer instead (same
-      # translation principle used throughout this project for selectors
-      # and stringWithUTF8String:).
+    var q = 0
+    while q < enc.len and enc[q] in {'r', 'n', 'N', 'o', 'O', 'R', 'V'}: inc q
+    if argCStr[i]:
+      # rawVal is a GUEST address — copy the C string into a real host buffer.
       let s = readGuestString(rawVal)
       let hostBuf = cMalloc(csize_t(s.len + 1))
       if s.len > 0:
@@ -572,11 +683,13 @@ proc callObjcMsgSendGeneric*(
       cast[ptr UncheckedArray[byte]](hostBuf)[s.len] = 0
       m.storage = cast[uint64](hostBuf)
       m.hostBufToFree = hostBuf
+    elif q < enc.len and enc[q] == '@' and translateObj != nil:
+      m.storage = translateObj(rawVal)
+    elif q < enc.len and enc[q] == ':' and translateSel != nil:
+      m.storage = translateSel(rawVal)
     margs[i] = m
-    argTypes[i] = info.ty
 
-  # ---- build the full type/value arrays: self (id) + _cmd (SEL) always
-  # come first and are always pointer-shaped, then the real args ----
+  # ---- full type/value arrays: self (id) + _cmd (SEL), then the real args ----
   var allTypes = newSeq[pointer](realArgCount + 2)
   allTypes[0] = ffi_type_pointer
   allTypes[1] = ffi_type_pointer
@@ -586,52 +699,80 @@ proc callObjcMsgSendGeneric*(
   let prepErr = ffi_prep_cif(cifBuf.cstring, FFI_DEFAULT_ABI, cuint(realArgCount + 2),
                               retType, addr allTypes[0])
   if prepErr != 0:
-    for m in margs:
-      if m.hostBufToFree != nil: cFree(m.hostBufToFree)
-    result.reason = &"ffi_prep_cif failed (code {prepErr})"
-    return
+    cleanupAndFail(&"ffi_prep_cif failed (code {prepErr})")
 
   var allValStorage = newSeq[uint64](realArgCount + 2)
   allValStorage[0] = selfPtr
   allValStorage[1] = cast[uint64](realSel)
   for i in 0 ..< realArgCount: allValStorage[i + 2] = margs[i].storage
   var allValPtrs = newSeq[pointer](realArgCount + 2)
-  for i in 0 ..< realArgCount + 2: allValPtrs[i] = addr allValStorage[i]
+  allValPtrs[0] = addr allValStorage[0]
+  allValPtrs[1] = addr allValStorage[1]
+  for i in 0 ..< realArgCount:
+    allValPtrs[i + 2] =
+      (if argKinds[i] == akStruct: cast[pointer](addr structBufs[i][0])
+       else: cast[pointer](addr allValStorage[i + 2]))
 
   var structRetSize = 0
   if retIsStruct:
     structRetSize = int(cast[ptr FfiTypeRaw](retType).size)
-    if structRetSize > 16:
-      # AAPCS64 returns structs bigger than 16 bytes via an INDIRECT
-      # convention (caller passes a hidden pointer in X8; the guest call
-      # site expects that address, which this project's thunk dispatch
-      # doesn't currently read/thread through at all) — a materially
-      # different, larger mechanism than the 2-register case handled
-      # below. Declined rather than guessed at.
-      for m in margs:
-        if m.hostBufToFree != nil: cFree(m.hostBufToFree)
-      result.reason = &"struct return type '{retEnc}' is {structRetSize} bytes (>16) — needs AAPCS64's indirect/X8-pointer return convention, not supported yet"
-      return
+    if structRetSize == 0: structRetSize = structSizeOf(retType)
 
-  var retStorage: array[2, uint64] = [0'u64, 0'u64]  # 16 bytes total, enough for any struct we accept above
+  var retStorage = newSeq[byte](max(structRetSize, 16) + 16)  # zeroed
   ffi_call(cifBuf.cstring, objcMsgSendAddr, addr retStorage[0], addr allValPtrs[0])
 
   for m in margs:
     if m.hostBufToFree != nil: cFree(m.hostBufToFree)
 
+  proc word(b: seq[byte], k: int): uint64 =
+    for j in 0 ..< 8: result = result or (uint64(b[k * 8 + j]) shl (8 * j))
+
   result.ok = true
   if retIsStruct:
-    result.retIsStruct = true
     result.retSize = structRetSize
-    result.retWords = retStorage
-    result.retVal = retStorage[0]
+    result.retBytes = retStorage[0 ..< structRetSize]
+    let h = hfaInfo(retEnc)
+    if h.isHfa:
+      result.retIsHfa = true
+      result.retHfaCount = h.count
+      result.retHfaElemSize = h.elemSize
+    elif structRetSize <= 16:
+      result.retIsStruct = true
+      result.retWords = [word(retStorage, 0), word(retStorage, 1)]
+      result.retVal = result.retWords[0]
+    else:
+      result.retIndirect = true
   elif retIsScalarFloat:
     result.retIsScalarFloat = true
-    result.retVal = retStorage[0]
-    # retStorage[0]'s raw bits are exactly what D0 needs: libffi writes a
-    # float return into the low 4 bytes and a double into all 8 bytes of
-    # the buffer, and AAPCS64 likewise only cares about the low 32 bits
-    # of D0 for a float return (S0 aliases them) — same 8-byte write
-    # works correctly for both cases.
+    result.retVal = word(retStorage, 0)
+    # libffi writes a float into the low 4 bytes / a double into all 8; D0
+    # only needs those raw bits (S0 aliases the low 32 bits of D0).
   else:
-    result.retVal = (if isVoidReturn: 0'u64 else: retStorage[0])
+    result.retVal = (if isVoidReturn: 0'u64 else: word(retStorage, 0))
+
+
+# ---- host->guest callbacks: native IMPs backed by libffi closures ------------
+type GuestImpHandler* = proc(cif: pointer, ret: pointer, args: pointer, userData: pointer) {.cdecl.}
+
+var closureCifs: seq[pointer]  # keep cifs + type arrays alive forever
+
+proc makeImpClosure*(handler: GuestImpHandler, userData: pointer): pointer =
+  ## Returns a real, callable host function pointer with the shape
+  ## `id fn(id self, SEL _cmd, id a1, id a2, id a3)`; calling it invokes
+  ## `handler`. Extra trailing args are harmless on x86_64 SysV (they're
+  ## just registers). Used as the IMP for guest-defined Objective-C methods.
+  if not runtimeReady or ffiClosureAllocAddr == nil or ffiPrepClosureLocAddr == nil:
+    return nil
+  type AllocFn = proc(size: csize_t, code: ptr pointer): pointer {.cdecl.}
+  type PrepFn = proc(closure: pointer, cif: pointer, fun: pointer, ud: pointer, codeLoc: pointer): cint {.cdecl.}
+  let cif = c_malloc(FfiCifBufSize)
+  let types = cast[ptr UncheckedArray[pointer]](c_malloc(5 * sizeof(pointer)))
+  for i in 0 ..< 5: types[i] = ffi_type_pointer
+  if ffi_prep_cif(cif, FFI_DEFAULT_ABI, 5, ffi_type_pointer, types) != 0: return nil
+  closureCifs.add(cif)
+  var code: pointer = nil
+  let closure = cast[AllocFn](ffiClosureAllocAddr)(256, addr code)
+  if closure == nil: return nil
+  if cast[PrepFn](ffiPrepClosureLocAddr)(closure, cif, cast[pointer](handler), userData, code) != 0:
+    return nil
+  code

@@ -70,19 +70,29 @@ type
   AutoreleasePoolPopFn = proc(token: pointer) {.cdecl.}
 
 proc readGuestString(uc: UcHandle, addr0: uint64, maxLen: int = 4096): string =
-  ## Read a null-terminated string from guest memory (used for open()'s
-  ## path, and — critically — for translating a guest-space selector
-  ## reference into its real string before asking the host runtime for the
-  ## real SEL, see resolveSel below).
-  var buf = newSeq[byte](maxLen)
-  if uc_mem_read(uc, addr0, addr buf[0], csize_t maxLen) != 0:
-    return ""
-  var n = 0
-  while n < maxLen and buf[n] != 0:
-    inc n
-  result = newString(n)
-  if n > 0:
-    copyMem(addr result[0], addr buf[0], n)
+  ## Read a null-terminated string from guest memory (open()'s path, selector
+  ## names, C-string arguments...). Reads in small chunks so a string sitting
+  ## near the end of a mapped segment doesn't make the whole read fail.
+  var buf = newSeq[byte](64)
+  var cur = addr0
+  while result.len < maxLen:
+    var got = 0
+    var chunk = 64
+    while chunk >= 1:
+      if uc_mem_read(uc, cur, addr buf[0], csize_t chunk) == 0:
+        got = chunk
+        break
+      chunk = chunk div 2
+    if got == 0: return
+    for i in 0 ..< got:
+      if buf[i] == 0: return
+      result.add(char(buf[i]))
+    cur += uint64(got)
+
+proc readGuestBytes(uc: UcHandle, addr0: uint64, n: int): seq[byte] =
+  result = newSeq[byte](n)
+  if n > 0 and uc_mem_read(uc, addr0, addr result[0], csize_t n) != 0:
+    result = @[]
 
 let libobjc = loadLib("/usr/lib/libobjc.A.dylib")
 var objcMsgSendAddr: pointer = nil
@@ -106,6 +116,10 @@ if objcMsgSendAddr == nil and verboseMode:
 # system, so no new files/downloads are involved. ----
 let libFoundation = loadLib("/System/Library/Frameworks/Foundation.framework/Foundation")
 let libCF = loadLib("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+# AppKit (and thereby the real WindowServer connection, run loop, windows...)
+# lives on the HOST — the arm64 guest only ever drives it through thunks.
+let libAppKit = loadLib("/System/Library/Frameworks/AppKit.framework/AppKit")
+let libSystemH = loadLib("/usr/lib/libSystem.B.dylib")
 var nsLogAddr: pointer = nil
 var cfConstantStringClassAddr: pointer = nil
 if libFoundation != nil:
@@ -171,6 +185,84 @@ proc resolveDataSymbol(name: string): tuple[ok: bool, value: uint64] =
     return (true, cast[uint64](cfConstantStringClassAddr))
   return (false, 0'u64)
 
+# ---- guest <-> host translation helpers --------------------------------------
+var guestRanges: seq[tuple[lo, hi: uint64]]   # every guest-mapped region (filled in runLoad)
+var literalCache = initTable[uint64, uint64]()  # guest CFString literal addr -> retained host NSString
+
+proc inGuest(a: uint64): bool =
+  for r in guestRanges:
+    if a >= r.lo and a < r.hi: return true
+  false
+
+proc guestToHostObj(uc: UcHandle, a: uint64): uint64 =
+  ## An object pointer the guest hands to the host may point at a guest-memory
+  ## compile-time literal (@"...") whose bytes the host cannot see. Rebuild it
+  ## as a real, retained host NSString (cached per literal). Anything else is
+  ## passed through unchanged (host objects are already real host pointers).
+  if a == 0 or not inGuest(a): return a
+  if literalCache.hasKey(a): return literalCache[a]
+  let b = readGuestBytes(uc, a, 32)
+  if b.len < 32: return a
+  var isa: uint64 = 0
+  for i in 0 ..< 8: isa = isa or (uint64(b[i]) shl (8 * i))
+  if cfConstantStringClassAddr == nil or isa != cast[uint64](cfConstantStringClassAddr): return a
+  var strAddr: uint64 = 0
+  for i in 0 ..< 8: strAddr = strAddr or (uint64(b[16 + i]) shl (8 * i))
+  let text = readGuestString(uc, strAddr, 65536)
+  let nsStringCls = cast[ObjcGetClassFn](objcGetClassAddr)("NSString")
+  let selAlloc = cast[SelRegisterNameFn](selRegisterNameAddr)("alloc")
+  let selInit = cast[SelRegisterNameFn](selRegisterNameAddr)("initWithUTF8String:")
+  let raw = callObjcMsgSendRaw(objcMsgSendAddr, nsStringCls, selAlloc, @[])
+  let hostBuf = c_malloc(csize_t(text.len + 1))
+  if text.len > 0: copyMem(hostBuf, unsafeAddr text[0], text.len)
+  cast[ptr UncheckedArray[byte]](hostBuf)[text.len] = 0
+  let obj = callObjcMsgSendRaw(objcMsgSendAddr, raw, selInit, @[hostBuf])
+  c_free(hostBuf)
+  literalCache[a] = cast[uint64](obj)
+  cast[uint64](obj)
+
+proc guestToHostSel(uc: UcHandle, a: uint64): uint64 =
+  if a == 0 or not inGuest(a): return a
+  cast[uint64](resolveSel(uc, a))
+
+# ---- host DATA variables (e.g. NSApp, NSDefaultRunLoopMode) ------------------
+# A bind to a data symbol makes the guest load the variable's value through
+# the GOT slot, i.e. the slot must hold a GUEST-readable address. We give each
+# such variable a "shadow cell" in guest memory and re-copy the real host
+# value into it after every thunk call (NSApp only becomes non-nil once the
+# guest has called +sharedApplication, for instance).
+const
+  ShadowBase: uint64 = 0x400000000'u64
+  ShadowSize: uint64 = 0x1000'u64
+  shadowVarNames = ["_NSApp", "_NSDefaultRunLoopMode", "_NSEventTrackingRunLoopMode",
+                    "_NSModalPanelRunLoopMode", "_NSRunLoopCommonModes",
+                    "_NSPasteboardTypeString", "_NSFontAttributeName",
+                    "_NSForegroundColorAttributeName", "_NSBackgroundColorAttributeName",
+                    "_NSParagraphStyleAttributeName", "___stack_chk_guard"]
+
+type ShadowVar = object
+  name: string
+  hostAddr: pointer
+  guestAddr: uint64
+
+var shadowVars: seq[ShadowVar]
+
+var stackGuardValue: uint64 = 0x5a17c0de5eed0001'u64
+
+proc findHostData(sym: string): pointer =
+  if sym == "___stack_chk_guard": return addr stackGuardValue
+  let n = sym[1 .. ^1]  # strip the leading underscore
+  for lib in [libAppKit, libFoundation, libCF]:
+    if lib != nil:
+      let p = symAddr(lib, n)
+      if p != nil: return p
+  nil
+
+proc syncShadowVars(uc: UcHandle) =
+  for sv in shadowVars:
+    var v: uint64 = cast[ptr uint64](sv.hostAddr)[]
+    discard uc_mem_write(uc, sv.guestAddr, addr v, 8)
+
 type ThunkProc = proc(uc: UcHandle) {.closure.}
 
 proc thunkReturn(uc: UcHandle, x0: uint64) =
@@ -196,6 +288,13 @@ proc thunkReturnStruct2(uc: UcHandle, w0: uint64, w1: uint64) =
   var pc: culonglong = lr
   discard uc_reg_write(uc, UC_ARM64_REG_PC, addr pc)
 
+proc thunkReturnVoidKeepRegs(uc: UcHandle) =
+  ## Return to the caller (PC = LR) without touching X0 / return registers.
+  var lr: culonglong
+  discard uc_reg_read(uc, UC_ARM64_REG_X30, addr lr)
+  var pc: culonglong = lr
+  discard uc_reg_write(uc, UC_ARM64_REG_PC, addr pc)
+
 proc thunkReturnFloat(uc: UcHandle, bits: uint64) =
   ## For scalar float/double returns: AAPCS64 returns these in D0, NOT
   ## X0 — writing X0 instead (as an earlier version of this code did
@@ -210,7 +309,7 @@ proc thunkReturnFloat(uc: UcHandle, bits: uint64) =
   var pc: culonglong = lr
   discard uc_reg_write(uc, UC_ARM64_REG_PC, addr pc)
 
-let thunkTable = {
+var thunkTable = {
   "_getpid": ThunkProc(proc(uc: UcHandle) =
     thunkReturn(uc, uint64 c_getpid())
   ),
@@ -246,6 +345,7 @@ let thunkTable = {
       var selfPtr, selPtr: culonglong
       discard uc_reg_read(uc, UC_ARM64_REG_X0, addr selfPtr)
       discard uc_reg_read(uc, UC_ARM64_REG_X1, addr selPtr)
+      selfPtr = culonglong(guestToHostObj(uc, uint64 selfPtr))
       let selName = readGuestString(uc, uint64 selPtr, 256)
       let realSel = resolveSel(uc, uint64 selPtr)
 
@@ -255,19 +355,30 @@ let thunkTable = {
           uc, objcMsgSendAddr, uint64 selfPtr, realSel, selName,
           proc(a: uint64): string = readGuestString(uc, a, 4096),
           proc(sz: csize_t): pointer = c_malloc(sz),
-          proc(p: pointer) = c_free(p)
+          proc(p: pointer) = c_free(p),
+          proc(a: uint64): uint64 = guestToHostObj(uc, a),
+          proc(a: uint64): uint64 = guestToHostSel(uc, a),
+          proc(a: uint64, n: int): seq[byte] = readGuestBytes(uc, a, n)
         )
         if genResult.ok:
           if verboseMode:
-            var lrDbg: culonglong
-            discard uc_reg_read(uc, UC_ARM64_REG_X30, addr lrDbg)
-            if genResult.retIsStruct:
-              echo &"[thunk] objc_msgSend: '{selName}' handled generically via libffi (struct return, {genResult.retSize} bytes), words=({genResult.retWords[0]:#x}, {genResult.retWords[1]:#x}), LR(X30)={uint64(lrDbg):#x}"
-            elif genResult.retIsScalarFloat:
-              echo &"[thunk] objc_msgSend: '{selName}' handled generically via libffi (float/double return -> D0), bits={genResult.retVal:#x}, LR(X30)={uint64(lrDbg):#x}"
-            else:
-              echo &"[thunk] objc_msgSend: '{selName}' handled generically via libffi, retVal={genResult.retVal:#x}, LR(X30)={uint64(lrDbg):#x}"
-          if genResult.retIsStruct:
+            echo &"[thunk] objc_msgSend: '{selName}' handled generically via libffi, retVal={genResult.retVal:#x}"
+          if genResult.retIsHfa:
+            # HFA struct return: one member per D register
+            for k in 0 ..< genResult.retHfaCount:
+              var bits: uint64 = 0
+              for b in 0 ..< genResult.retHfaElemSize:
+                bits = bits or (uint64(genResult.retBytes[k * genResult.retHfaElemSize + b]) shl (8 * b))
+              var v: culonglong = bits
+              discard uc_reg_write(uc, UC_ARM64_REG_D0 + cint(k), addr v)
+            thunkReturnVoidKeepRegs(uc)
+          elif genResult.retIndirect:
+            var x8: culonglong
+            discard uc_reg_read(uc, UC_ARM64_REG_X8, addr x8)
+            if genResult.retBytes.len > 0:
+              discard uc_mem_write(uc, uint64 x8, unsafeAddr genResult.retBytes[0], csize_t genResult.retBytes.len)
+            thunkReturn(uc, uint64 x8)
+          elif genResult.retIsStruct:
             thunkReturnStruct2(uc, genResult.retWords[0], genResult.retWords[1])
           elif genResult.retIsScalarFloat:
             thunkReturnFloat(uc, genResult.retVal)
@@ -502,6 +613,134 @@ let thunkTable = {
   ),
 }.toTable
 
+
+# ---- plain "pointer args in, pointer out" libobjc entry points the compiler
+# emits instead of objc_msgSend (ARC helpers, objc_alloc, ...). Object args
+# are run through guestToHostObj so guest @"..." literals are valid hosts-side.
+proc makeSimpleThunk(fn: pointer, nargs: int): ThunkProc =
+  result = proc(uc: UcHandle) =
+    var args: seq[uint64]
+    for i in 0 ..< nargs:
+      var v: culonglong
+      discard uc_reg_read(uc, UC_ARM64_REG_X0 + cint(i), addr v)
+      args.add(if i == 0: guestToHostObj(uc, uint64 v) else: uint64 v)
+    thunkReturn(uc, callHostPtrFn(fn, args))
+
+if libobjc != nil:
+  for (nm, n) in [("objc_alloc", 1), ("objc_allocWithZone", 2), ("objc_alloc_init", 1),
+                  ("objc_opt_new", 1), ("objc_opt_class", 1), ("objc_opt_isKindOfClass", 2),
+                  ("objc_retain", 1), ("objc_release", 1), ("objc_autorelease", 1),
+                  ("objc_retainAutoreleasedReturnValue", 1), ("objc_autoreleaseReturnValue", 1),
+                  ("objc_retainAutorelease", 1), ("objc_retainAutoreleaseReturnValue", 1),
+                  ("objc_unsafeClaimAutoreleasedReturnValue", 1)]:
+    let p = symAddr(libobjc, nm)
+    if p != nil and not thunkTable.hasKey("_" & nm):
+      thunkTable["_" & nm] = makeSimpleThunk(p, n)
+
+
+# ---- guest-defined Objective-C classes (runtime API) + host->guest callbacks --
+# A guest program can build a class at runtime with the plain C runtime API
+# (objc_allocateClassPair / class_addMethod / objc_registerClassPair), giving
+# class_addMethod a pointer to one of ITS OWN arm64 functions as the IMP. We
+# register a real host function (a libffi closure) as the IMP instead; when
+# AppKit (running natively on the host) invokes it — e.g. on a button click —
+# the closure re-enters Unicorn (nested uc_emu_start) and runs the guest
+# function, then returns its result to the host.
+const CallbackRet: uint64 = 0x500000000'u64   # LR target that ends a nested guest call
+var activeUc: UcHandle = nil
+
+proc guestImpHandler(cif: pointer, ret: pointer, args: pointer, ud: pointer) {.cdecl.} =
+  let uc = activeUc
+  let a = cast[ptr UncheckedArray[pointer]](args)
+  if verboseMode:
+    echo &"[callback] host -> guest IMP 0x{cast[uint64](ud):x} (nested uc_emu_start)"
+  var ctx: pointer = nil
+  discard uc_context_alloc(uc, addr ctx)
+  discard uc_context_save(uc, ctx)
+  for i in 0 .. 4:
+    var v: culonglong = cast[ptr uint64](a[i])[]
+    discard uc_reg_write(uc, UC_ARM64_REG_X0 + cint(i), addr v)
+  var sp: culonglong
+  discard uc_reg_read(uc, UC_ARM64_REG_SP, addr sp)
+  sp = (sp - 0x400) and not 0xF'u64
+  discard uc_reg_write(uc, UC_ARM64_REG_SP, addr sp)
+  var lr: culonglong = CallbackRet
+  discard uc_reg_write(uc, UC_ARM64_REG_X30, addr lr)
+  let err = uc_emu_start(uc, culonglong(cast[uint64](ud)), culonglong CallbackRet, 0, 0)
+  if err != 0 and verboseMode:
+    echo &"[callback] nested guest call ended with {$uc_strerror(err)}"
+  var x0: culonglong
+  discard uc_reg_read(uc, UC_ARM64_REG_X0, addr x0)
+  discard uc_context_restore(uc, ctx)
+  discard uc_context_free(ctx)
+  cast[ptr uint64](ret)[] = uint64 x0
+  syncShadowVars(uc)
+
+proc hostCStr(uc: UcHandle, a: uint64): pointer =
+  let str = readGuestString(uc, a, 4096)
+  let p = c_malloc(csize_t(str.len + 1))
+  if str.len > 0: copyMem(p, unsafeAddr str[0], str.len)
+  cast[ptr UncheckedArray[byte]](p)[str.len] = 0
+  p
+
+proc reg(uc: UcHandle, i: int): uint64 =
+  var v: culonglong
+  discard uc_reg_read(uc, UC_ARM64_REG_X0 + cint(i), addr v)
+  uint64 v
+
+if libobjc != nil:
+  let pGetClass = symAddr(libobjc, "objc_getClass")
+  let pSelReg = symAddr(libobjc, "sel_registerName")
+  let pAlloc = symAddr(libobjc, "objc_allocateClassPair")
+  let pAddM = symAddr(libobjc, "class_addMethod")
+  let pReg = symAddr(libobjc, "objc_registerClassPair")
+  thunkTable["_objc_getClass"] = ThunkProc(proc(uc: UcHandle) =
+    let n = hostCStr(uc, reg(uc, 0))
+    let r = callHostPtrFn(pGetClass, @[cast[uint64](n)])
+    c_free(n); thunkReturn(uc, r))
+  thunkTable["_sel_registerName"] = ThunkProc(proc(uc: UcHandle) =
+    let n = hostCStr(uc, reg(uc, 0))
+    let r = callHostPtrFn(pSelReg, @[cast[uint64](n)])
+    c_free(n); thunkReturn(uc, r))
+  thunkTable["_objc_allocateClassPair"] = ThunkProc(proc(uc: UcHandle) =
+    let n = hostCStr(uc, reg(uc, 1))
+    let r = callHostPtrFn(pAlloc, @[guestToHostObj(uc, reg(uc, 0)), cast[uint64](n), reg(uc, 2)])
+    thunkReturn(uc, r))  # name buffer intentionally leaked: runtime may keep it
+  thunkTable["_class_addMethod"] = ThunkProc(proc(uc: UcHandle) =
+    let impGuest = reg(uc, 2)
+    let imp = makeImpClosure(guestImpHandler, cast[pointer](impGuest))
+    let types = hostCStr(uc, reg(uc, 3))
+    let r = callHostPtrFn(pAddM, @[reg(uc, 0), guestToHostSel(uc, reg(uc, 1)), cast[uint64](imp), cast[uint64](types)])
+    thunkReturn(uc, r and 0xFF))
+  thunkTable["_objc_registerClassPair"] = ThunkProc(proc(uc: UcHandle) =
+    discard callHostPtrFn(pReg, @[reg(uc, 0)])
+    thunkReturn(uc, 0))
+
+
+# ---- minimal guest-memory libc: these operate on GUEST memory, so they must
+# be emulated here rather than forwarded to the host's libc.
+proc guestCopy(uc: UcHandle, dst, src: uint64, n: int) =
+  if n <= 0: return
+  var buf = newSeq[byte](n)
+  if uc_mem_read(uc, src, addr buf[0], csize_t n) == 0:
+    discard uc_mem_write(uc, dst, addr buf[0], csize_t n)
+
+thunkTable["_memcpy"] = ThunkProc(proc(uc: UcHandle) =
+  guestCopy(uc, reg(uc, 0), reg(uc, 1), int reg(uc, 2)); thunkReturn(uc, reg(uc, 0)))
+thunkTable["_memmove"] = thunkTable["_memcpy"]
+thunkTable["_memset"] = ThunkProc(proc(uc: UcHandle) =
+  let n = int reg(uc, 2)
+  if n > 0:
+    var buf = newSeq[byte](n)
+    for i in 0 ..< n: buf[i] = byte(reg(uc, 1) and 0xFF)
+    discard uc_mem_write(uc, reg(uc, 0), addr buf[0], csize_t n)
+  thunkReturn(uc, reg(uc, 0)))
+thunkTable["_strlen"] = ThunkProc(proc(uc: UcHandle) =
+  thunkReturn(uc, uint64 readGuestString(uc, reg(uc, 0), 1 shl 20).len))
+thunkTable["___stack_chk_fail"] = ThunkProc(proc(uc: UcHandle) =
+  echo "86arm: guest stack smashing detected (__stack_chk_fail) — stopping."
+  discard uc_emu_stop(uc))
+
 var thunkSlotName: Table[uint64, string]  # thunk slot address -> symbol name, filled per-load
 
 proc onThunkCode(uc: UcHandle, address: culonglong, size: uint32, userData: pointer) {.cdecl.} =
@@ -514,6 +753,7 @@ proc onThunkCode(uc: UcHandle, address: culonglong, size: uint32, userData: poin
         discard uc_reg_read(uc, UC_ARM64_REG_X30, addr lrDbg)
         echo &"[thunk] calling real host function for {name} (thunk-slot pc=0x{addr0:x}, LR(X30)=0x{uint64(lrDbg):x})"
       thunkTable[name](uc)
+      syncShadowVars(uc)
     else:
       echo &"86arm: hit thunk slot for '{name}' but no host implementation is wired up for it yet — stopping."
       discard uc_emu_stop(uc)
@@ -757,7 +997,7 @@ proc runLoad(path: string, trace: bool = false) =
     for b in bound:
       if thunkTable.hasKey(b.symbolName):
         inc thunkedCount
-      elif resolveDataSymbol(b.symbolName).ok:
+      elif resolveDataSymbol(b.symbolName).ok or b.symbolName in shadowVarNames:
         inc dataResolvableCount
       elif b.symbolName notin unthunkedNames:
         unthunkedNames.add(b.symbolName)
@@ -818,6 +1058,7 @@ proc runLoad(path: string, trace: bool = false) =
 
     let segEnd = seg.vmaddr + mapSize
     if segEnd > highestAddr: highestAddr = segEnd
+    guestRanges.add((seg.vmaddr, segEnd))
 
     if verboseMode:
       echo &"  mapped {seg.name}: vmaddr=0x{seg.vmaddr:x} size=0x{seg.vmsize:x} prot={seg.initprot}"
@@ -835,6 +1076,29 @@ proc runLoad(path: string, trace: bool = false) =
   checkErr(uc, uc_mem_map(uc, stackBase, StackSize, uint32(UC_PROT_READ or UC_PROT_WRITE)), "map stack")
   var sp: culonglong = stackBase + StackSize - 0x10
   discard uc_reg_write(uc, UC_ARM64_REG_SP, addr sp)
+  guestRanges.add((stackBase, stackBase + StackSize))
+  activeUc = uc
+  checkErr(uc, uc_mem_map(uc, CallbackRet, 0x1000, uint32(UC_PROT_READ or UC_PROT_EXEC)), "map callback-return page")
+
+  # ---- shadow cells for host DATA variables bound by this binary ----
+  shadowVars.setLen(0)
+  var shadowMapped = false
+  var shadowNext = ShadowBase
+  for b in bound:
+    if b.symbolName in shadowVarNames:
+      let hp = findHostData(b.symbolName)
+      if hp == nil: continue
+      if not shadowMapped:
+        checkErr(uc, uc_mem_map(uc, ShadowBase, csize_t ShadowSize, uint32(UC_PROT_READ or UC_PROT_WRITE)), "map shadow")
+        guestRanges.add((ShadowBase, ShadowBase + ShadowSize))
+        shadowMapped = true
+      shadowVars.add(ShadowVar(name: b.symbolName, hostAddr: hp, guestAddr: shadowNext))
+      var slot: uint64 = shadowNext
+      discard uc_mem_write(uc, b.address, addr slot, 8)
+      if verboseMode:
+        echo &"[bind] {b.symbolName} -> shadow cell 0x{shadowNext:x} mirroring host variable"
+      shadowNext += 8
+  syncShadowVars(uc)
 
   # ---- apply rebase fixups: internal pointer slots (Objective-C selector
   # refs, vtables, string pointers...) whose raw bytes are just encoded
