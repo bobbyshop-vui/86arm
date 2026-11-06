@@ -127,6 +127,77 @@ proc listImports*(path: string): seq[ImportedSymbol] =
       fromDylib: lib.name.to(string).strip(chars = {'\0'})
     ))
 
+
+proc rd32(d: string, o: int): uint32 =
+  for i in 0 ..< 4: result = result or (uint32(ord(d[o + i])) shl (8 * i))
+proc rd64(d: string, o: int): uint64 =
+  for i in 0 ..< 8: result = result or (uint64(ord(d[o + i])) shl (8 * i))
+proc rd16(d: string, o: int): uint16 =
+  uint16(ord(d[o])) or (uint16(ord(d[o + 1])) shl 8)
+
+proc walkChainedFixups*(path: string, imageBase: uint64): tuple[binds: seq[BoundSymbol], rebases: seq[RebaseEntry]] =
+  ## Independent walk of LC_DYLD_CHAINED_FIXUPS (formats DYLD_CHAINED_PTR_64 /
+  ## _64_OFFSET). LIEF was observed to drop the FIRST fixup of some chains
+  ## (e.g. the first slot of a constant-array's element table), leaving the
+  ## guest with a still-encoded pointer; this walk is the source of truth and
+  ## its results are merged with LIEF's by the caller.
+  let d = readFile(path)
+  if d.len < 32 or rd32(d, 0) != 0xFEEDFACF'u32: return
+  let ncmds = int rd32(d, 16)
+  var off = 32
+  var dataoff = 0
+  for _ in 0 ..< ncmds:
+    let cmd = rd32(d, off)
+    let sz = int rd32(d, off + 4)
+    if cmd == 0x80000034'u32: dataoff = int rd32(d, off + 8)
+    off += sz
+  if dataoff == 0: return
+  let f = dataoff
+  let startsOff = f + int rd32(d, f + 4)
+  let importsOff = f + int rd32(d, f + 8)
+  let symbolsOff = f + int rd32(d, f + 12)
+  let importsFmt = rd32(d, f + 20)
+  let segCount = int rd32(d, startsOff)
+  for si in 0 ..< segCount:
+    let sio = int rd32(d, startsOff + 4 + si * 4)
+    if sio == 0: continue
+    let seg = startsOff + sio
+    let pageSize = uint64 rd16(d, seg + 4)
+    let fmt = rd16(d, seg + 6)
+    let segOffset = rd64(d, seg + 8)
+    let pageCount = int rd16(d, seg + 20)
+    if fmt != 2 and fmt != 6: continue
+    for pi in 0 ..< pageCount:
+      let ps = rd16(d, seg + 22 + pi * 2)
+      if ps == 0xFFFF'u16: continue
+      var addrV = imageBase + segOffset + uint64(pi) * pageSize + uint64 ps
+      # the chain's slots live in the FILE at (segment fileoff + (addr - segvm)); map addr->file
+      # using the segment table is overkill: segment fileoff == segment vm offset
+      # for the Mach-O layouts clang/ld64 emit (fileoff = vmaddr - base).
+      while true:
+        let fo = int(addrV - imageBase)
+        if fo + 8 > d.len: break
+        let raw = rd64(d, fo)
+        let nxt = int((raw shr 51) and 0xFFF)
+        if (raw shr 63) == 1:
+          let ordinal = int(raw and 0xFFFFFF'u64)
+          var name = ""
+          let iOff = importsOff + (if importsFmt == 2: ordinal * 8 else: ordinal * 4)
+          let w = rd32(d, iOff)
+          let libOrd = int(w and 0xFF)
+          let nameOff = int(w shr 9)
+          var k = symbolsOff + nameOff
+          while k < d.len and d[k] != '\0':
+            name.add(d[k]); inc k
+          result.binds.add(BoundSymbol(address: addrV, ordinal: libOrd, symbolName: name, libOrdinal: libOrd))
+        else:
+          let target = raw and 0xFFFFFFFFF'u64
+          let high8 = (raw shr 36) and 0xFF
+          let tv = (if fmt == 6: imageBase + target else: target)
+          result.rebases.add(RebaseEntry(address: addrV, targetVmaddr: (high8 shl 56) or tv))
+        if nxt == 0: break
+        addrV += uint64(nxt) * 4
+
 proc parseChainedFixups*(info: MachOInfo): tuple[binds: seq[BoundSymbol], rebases: seq[RebaseEntry]] =
   ## Returns every bound external symbol (binds) and internal pointer fixup
   ## (rebases) in the binary, via LIEF's unified `.bindings` / `.relocations`
@@ -155,3 +226,18 @@ proc parseChainedFixups*(info: MachOInfo): tuple[binds: seq[BoundSymbol], rebase
         address: r.address.to(uint64),
         targetVmaddr: r.target.to(uint64)
       ))
+
+  # ---- merge with an independent chain walk (fills anything LIEF missed) ----
+  var imageBase: uint64 = 0
+  for sgm in info.segments:
+    if sgm.name == "__TEXT": imageBase = sgm.vmaddr
+  if imageBase != 0:
+    let w = walkChainedFixups(info.path, imageBase)
+    var haveBind: seq[uint64]
+    for b in result.binds: haveBind.add(b.address)
+    for b in w.binds:
+      if b.address notin haveBind: result.binds.add(b)
+    var haveRb: seq[uint64]
+    for r in result.rebases: haveRb.add(r.address)
+    for r in w.rebases:
+      if r.address notin haveRb: result.rebases.add(r)

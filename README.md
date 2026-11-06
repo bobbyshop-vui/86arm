@@ -37,6 +37,7 @@ frameworks (the ObjC runtime, Foundation...) run for real on the host
 ```
 86arm/
 ├── build.sh                 # builds everything and runs all the tests, no network needed
+├── run.sh                   # launcher (use this instead of bin/86arm directly)
 ├── src/
 │   ├── main.nim              # CLI, Mach-O loader, thunk table, dispatch
 │   ├── unicorn_ffi.nim       # direct FFI binding to libunicorn (C)
@@ -91,6 +92,16 @@ signature," by asking the real runtime directly:
 | Struct **returns** up to 16 bytes, all-integer fields (e.g. `NSRange`) | ✅ |
 | `NSLog` with multiple varargs of any type (`%@`, `%lu`, `%f`...) | ✅ (parses the real format string, routes each argument correctly) |
 | Basic Foundation: `NSString`, `NSMutableArray`, `@autoreleasepool` | ✅ |
+| Struct **arguments** (`NSRect` etc.): HFA → `D0-D3`, ≤16 B → GP regs, >16 B → by reference | ✅ |
+| HFA / >16-byte struct **returns** (`CGRect` via hidden `X8` pointer) | ✅ |
+| Guest `@"..."` literals and `SEL` arguments passed to host APIs | ✅ (rebuilt as real host `NSString`/`SEL`) |
+| Host data globals (`NSApp`, run-loop modes) via guest shadow cells | ✅ |
+| **Blocks** (`^{...}`): host blocks calling back into the guest, `Block_copy`, `__block` vars, captured objects | ✅ `examples/test_blocks.m` |
+| libdispatch (`dispatch_async/after/sync/once`, all queues = main queue) and `NSTimer` blocks | ✅ |
+| libc on guest memory: `malloc/free`, `printf/snprintf/puts`, `str*/mem*`, math, FORTIFY `_chk` variants | ✅ |
+| Variadic formatting: `NSLog`, `stringWithFormat:`, `printf` (ints, doubles, `%s`, `%@`) | ✅ (own printf engine over the guest stack) |
+| Constant `@[...]`/`@42` literals clang puts in `__DATA`, collection literal constructors | ✅ |
+| **Real AppKit UI** (`NSApplication`/`NSWindow`/`NSMenu`/`NSTextField`, `[NSApp run]`) | ✅ `examples/test_appkit.m` |
 
 Tests live in `examples/` — running `./build.sh` builds and runs all of
 them, printing `--verbose` logs for each step.
@@ -99,11 +110,7 @@ them, printing `--verbose` logs for each step.
 
 | Missing | Why | Patchable? |
 |---|---|---|
-| Struct **arguments** (`initWithFrame:` taking an `NSRect`) | Needs packing struct fields into the right GP/FP registers when passing *in*, the reverse direction of the struct-return support already built | Yes, not done yet |
-| Structs with `float`/`double` fields over 8 bytes, or struct returns over 16 bytes (`CGRect`, `CGSize`) | AAPCS64 uses HFA rules (all in `D0-D3`) or an indirect convention via a hidden `X8` pointer — different from the `X0/X1` mechanism already built | Yes, not done yet |
-| Block callbacks (`^{...}`) | Needs a real host-side closure via `ffi_closure` so the host can call back into guest code | Meaningfully harder, not done |
-| Arbitrary variadic C functions (beyond the hand-patched `NSLog`) | No `method_getArgumentType`-equivalent exists for plain C functions — can't ask the runtime | Has to be hand-patched per function |
-| Real AppKit UI actually appearing on screen | Needs a real run loop and a real WindowServer connection over Mach IPC — a different category of problem than "can call the function" | Not a patch — needs different architecture |
+| Blocks with FP args / >4 args, `NSConstantDictionary`/double literals, threads other than main | Block invoke forwards 4 pointer-sized args; Unicorn isn't thread-safe so every dispatch queue runs on the main thread | Partly patchable |
 | File-backed `mmap`, real dyld, complex post-rebase writable `__DATA` | Outside the loader's original scope | Out of scope |
 
 ## Building
@@ -128,7 +135,11 @@ binaries, then runs them through `bin/86arm`.
 
 ## Usage
 
+Use `./run.sh` (it exposes only `libpython` for the LIEF parser; a global
+`DYLD_LIBRARY_PATH` to the Python lib dir breaks AppKit loading).
+
 ```bash
+./run.sh bin/test_appkit        # arm64 Cocoa window on an x86 Mac (Cmd+Q quits)
 86arm <arm64-file>              # run it, only the program's own output is printed
 86arm --verbose <arm64-file>    # also print loader/thunk/bind diagnostics
 86arm --trace <arm64-file>      # print every guest instruction (very verbose, debug only)

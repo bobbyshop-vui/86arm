@@ -82,6 +82,10 @@ proc uc_reg_read*(uc: UcHandle, regid: cint, value: pointer): UcErr
 proc uc_emu_start*(uc: UcHandle, beg, `end`: culonglong, timeout: culonglong, count: csize_t): UcErr
 proc uc_emu_stop*(uc: UcHandle): UcErr
 proc uc_errno*(uc: UcHandle): UcErr
+proc uc_context_alloc*(uc: UcHandle, ctx: ptr pointer): UcErr
+proc uc_context_save*(uc: UcHandle, ctx: pointer): UcErr
+proc uc_context_restore*(uc: UcHandle, ctx: pointer): UcErr
+proc uc_context_free*(ctx: pointer): UcErr
 proc uc_strerror*(err: UcErr): cstring
 {.pop.}
 
