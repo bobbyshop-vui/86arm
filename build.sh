@@ -84,6 +84,11 @@ $CC -target arm64-apple-macos12 -isysroot $(xcrun --show-sdk-path) -framework Fo
     -o bin/test_callback examples/test_callback.m
 ./run.sh bin/test_callback
 
+echo "== 20. test_blocks: blocks, libdispatch, NSTimer, printf/NSString formatting, libc =="
+$CC -target arm64-apple-macos12 -isysroot $(xcrun --show-sdk-path) -framework Foundation \
+    -o bin/test_blocks examples/test_blocks.m
+./run.sh bin/test_blocks
+
 echo "== Done. Try: =="
 echo "  ./run.sh --hello                  # built-in demo"
 echo "  ./run.sh bin/hello_arm64           # real arm64 binary, just compiled"

@@ -494,6 +494,9 @@ type
       ## >16 byte struct return: the guest's X8 holds the address of a guest
       ## buffer that must receive retBytes.
     retBytes*: seq[byte]
+    retIsCString*: bool
+      ## return type is char* — the pointer is into HOST memory; the caller
+      ## copies the string into guest memory before handing it over.
     reason*: string  # only meaningful when ok == false, for --verbose logging
 
 proc readGpArgReg(uc: UcHandle, idx: int): uint64 =
@@ -603,7 +606,7 @@ proc callObjcMsgSendGeneric*(
     let enc = $(argBuf.cstring)
     argEncs[i] = enc
     let info = ffiTypeAndKindForEncodingFull(enc)
-    if not info.ok or enc.contains("@?"):
+    if not info.ok:
       result.reason = &"unsupported arg {i} type encoding '{enc}'"
       return
     argTypes[i] = info.ty
@@ -728,6 +731,10 @@ proc callObjcMsgSendGeneric*(
     for j in 0 ..< 8: result = result or (uint64(b[k * 8 + j]) shl (8 * j))
 
   result.ok = true
+  block:
+    var q = 0
+    while q < retEnc.len and retEnc[q] in {'r', 'n', 'N', 'o', 'O', 'R', 'V'}: inc q
+    result.retIsCString = q < retEnc.len and retEnc[q] == '*'
   if retIsStruct:
     result.retSize = structRetSize
     result.retBytes = retStorage[0 ..< structRetSize]
