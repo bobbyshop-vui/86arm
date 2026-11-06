@@ -36,15 +36,25 @@ frameworks (the ObjC runtime, Foundation...) run for real on the host
 
 ```
 86arm/
-├── build.sh                 # builds everything and runs all the tests, no network needed
-├── run.sh                   # launcher (use this instead of bin/86arm directly)
+├── build.sh                    # builds 86arm, compiles every example for arm64, runs the tests
+├── run.sh                      # launcher: use this instead of bin/86arm (exposes only libpython)
+├── LICENSE
+├── README.md
 ├── src/
-│   ├── main.nim              # CLI, Mach-O loader, thunk table, dispatch
-│   ├── unicorn_ffi.nim       # direct FFI binding to libunicorn (C)
-│   ├── machparse.nim         # real Mach-O parser (via nimpy + macholib)
-│   └── objc_ffi.nim          # libffi + Objective-C runtime introspection bridge
-├── examples/                 # test binaries, compiled for real with clang
-└── bin/                      # where build.sh puts the built binaries
+│   ├── main.nim                # CLI, Mach-O loader, thunk table, blocks, dispatch, libc, printf engine
+│   ├── unicorn_ffi.nim         # direct FFI binding to libunicorn (C), incl. context save/restore
+│   ├── machparse.nim           # Mach-O parser (nimpy + LIEF) plus own chained-fixup walker
+│   └── objc_ffi.nim            # libffi + ObjC runtime bridge: struct args/returns, libffi closures
+├── examples/                   # arm64 test programs, compiled with clang by build.sh
+│   ├── hello.c, hello_stdio.c, hello_math.c      # no-libSystem demos
+│   ├── mini_stdio.h, mini_math.h                 # tiny freestanding stdio/math helpers
+│   ├── test_getpid.c                             # single real thunk
+│   ├── test_objc_new.m, test_foundation.m        # objc_msgSend, NSLog
+│   ├── test_nsarray.m, test_struct_return.m, test_float.m
+│   ├── test_callback.m                           # host calls a guest-defined ObjC method
+│   ├── test_blocks.m                             # blocks, dispatch, NSTimer, printf, libc
+│   └── test_appkit.m                             # AppKit window, menu, button, timer
+└── bin/                        # build output (tracked): 86arm and the compiled example binaries
 ```
 
 ### `main.nim` — loader + thunk table
@@ -119,7 +129,7 @@ Prerequisites (install once, no network needed for builds after that):
 
 ```bash
 brew install unicorn
-pip3 install macholib
+pip3 install lief
 nimble install nimpy
 ```
 
